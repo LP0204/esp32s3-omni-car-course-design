@@ -1,5 +1,17 @@
-build/
-sdkconfig
-sdkconfig.old
+# macOS
 .DS_Store
-.vscode/
+**/.DS_Store
+
+# ESP-IDF generated files
+**/build/
+**/build-*/
+**/sdkconfig
+**/sdkconfig.old
+**/managed_components/
+
+# Local editor configuration
+**/.vscode/
+
+# Temporary files
+*.log
+*.tmp
