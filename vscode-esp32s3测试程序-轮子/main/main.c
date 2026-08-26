@@ -7,10 +7,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-/* Motor A。 */
-#define AIN1 GPIO_NUM_8
-#define AIN2 GPIO_NUM_9
-#define PWMA GPIO_NUM_10
+/* Motor D：左前轮。 */
+#define DIN1 GPIO_NUM_8
+#define DIN2 GPIO_NUM_9
+#define PWMD GPIO_NUM_10
 
 #define STBY GPIO_NUM_11
 
@@ -19,10 +19,10 @@
 #define BIN2 GPIO_NUM_13
 #define PWMB GPIO_NUM_14
 
-/* Motor D。 */
-#define DIN1 GPIO_NUM_15
-#define DIN2 GPIO_NUM_16
-#define PWMD GPIO_NUM_17
+/* Motor A：右前轮。 */
+#define AIN1 GPIO_NUM_15
+#define AIN2 GPIO_NUM_16
+#define PWMA GPIO_NUM_17
 
 #define PWM_FREQUENCY_HZ 20000
 #define DEFAULT_SPEED_PERCENT 100
@@ -52,15 +52,15 @@ typedef enum {
 static const char *TAG = "WHEEL_TEST";
 
 static motor_t motor_a = {
-    .name = "Motor A",
+    .name = "Motor A（右前轮）",
     .in1 = AIN1,
     .in2 = AIN2,
     .pwm_gpio = PWMA,
-    .pwm_channel = LEDC_CHANNEL_0,
+    .pwm_channel = LEDC_CHANNEL_2,
 };
 
 static motor_t motor_b = {
-    .name = "Motor B",
+    .name = "Motor B（后轮）",
     .in1 = BIN1,
     .in2 = BIN2,
     .pwm_gpio = PWMB,
@@ -68,11 +68,11 @@ static motor_t motor_b = {
 };
 
 static motor_t motor_d = {
-    .name = "Motor D",
+    .name = "Motor D（左前轮）",
     .in1 = DIN1,
     .in2 = DIN2,
     .pwm_gpio = PWMD,
-    .pwm_channel = LEDC_CHANNEL_2,
+    .pwm_channel = LEDC_CHANNEL_0,
 };
 
 static int speed_percent = DEFAULT_SPEED_PERCENT;
@@ -202,9 +202,9 @@ static void set_speed(int requested_percent)
 static void print_help(void)
 {
     ESP_LOGI(TAG, "========== 三轮电机测试命令 ==========");
-    ESP_LOGI(TAG, "A/a：Motor A 正转/反转");
-    ESP_LOGI(TAG, "B/b：Motor B 正转/反转");
-    ESP_LOGI(TAG, "D/d：Motor D 正转/反转");
+    ESP_LOGI(TAG, "A/a：Motor A（右前轮 GPIO15/16/17）正转/反转");
+    ESP_LOGI(TAG, "B/b：Motor B（后轮 GPIO12/13/14）正转/反转");
+    ESP_LOGI(TAG, "D/d：Motor D（左前轮 GPIO8/9/10）正转/反转");
     ESP_LOGI(TAG, "F/R：三个电机同时正转/反转");
     ESP_LOGI(TAG, "S：停止所有电机");
     ESP_LOGI(TAG, "+/-：速度增加/减少10%%");

@@ -10,12 +10,12 @@
 
 ## GPIO分配
 
-| 驱动通道 | IN1 | IN2 | PWM/使能 |
-|---|---:|---:|---:|
-| Motor A | GPIO8 | GPIO9 | GPIO10 |
-| Motor B | GPIO12 | GPIO13 | GPIO14 |
-| Motor D | GPIO15 | GPIO16 | GPIO17 |
-| 公共 STBY | GPIO11 | — | — |
+| 物理位置 | 驱动通道 | IN1 | IN2 | PWM/使能 |
+|---|---|---:|---:|---:|
+| 左前轮 | Motor D | GPIO8 | GPIO9 | GPIO10 |
+| 后轮 | Motor B | GPIO12 | GPIO13 | GPIO14 |
+| 右前轮 | Motor A | GPIO15 | GPIO16 | GPIO17 |
+| 公共使能 | STBY | GPIO11 | — | — |
 
 GPIO4～7为红外循迹模块保留，本程序不配置、不读取。
 
@@ -33,9 +33,9 @@ GPIO4～7为红外循迹模块保留，本程序不配置、不读取。
 
 | 命令 | 功能 |
 |---|---|
-| `A` / `a` | Motor A 正转 / 反转 |
-| `B` / `b` | Motor B 正转 / 反转 |
-| `D` / `d` | Motor D 正转 / 反转 |
+| `A` / `a` | Motor A（右前轮）正转 / 反转 |
+| `B` / `b` | Motor B（后轮）正转 / 反转 |
+| `D` / `d` | Motor D（左前轮）正转 / 反转 |
 | `F` / `R` | 三个电机同时正转 / 反转 |
 | `S` | 停止所有电机 |
 | `+` / `-` | 当前速度增加 / 减少10% |
