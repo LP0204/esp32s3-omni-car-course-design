@@ -1,6 +1,8 @@
-# 定速直行测试
+# 定速直行与四路传感器显示测试
 
 小车上电后保持停止。短按一次 ESP32-S3 的 BOOT 键，小车按设定功率直行，达到设定时间后自动停止。运行期间再次按 BOOT 可以提前停止；停止后再次按 BOOT 可以重复测试。
+
+LQ_TFT18SPIV33 屏幕会在上电后持续显示四路红外状态，从左到右为 OUT1、OUT2、OUT3、OUT4；`B` 表示黑色，`W` 表示白色。显示功能与直行控制同时运行，不需要连接电脑或打开 Monitor。
 
 本工程只驱动左前轮和右前轮。后轮 B 通道的 GPIO12、GPIO13、GPIO14 始终强制为低电平，不会参与直行。
 
@@ -25,3 +27,13 @@
 - 后轮 B：GPIO12/13/14
 - 右前轮 A：GPIO15/16/17
 - BOOT：GPIO0，按下为低电平
+- 红外 OUT1/OUT2/OUT3/OUT4：GPIO4/5/6/7
+- TFT SCLK：GPIO39
+- TFT SDI/MOSI：GPIO40
+- TFT CS：GPIO41
+- TFT DC/A0：GPIO42
+- TFT RST：GPIO47
+- TFT VCC、BL：3.3V（禁止接5V）
+- TFT GND：ESP32 GND
+
+显示屏不需要连接 MISO。显示屏、红外模块、电机驱动板和 ESP32-S3 必须共地。

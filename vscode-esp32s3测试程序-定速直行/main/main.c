@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "tft18_sensor_display.h"
 
 /* ======================== User-adjustable parameters ======================== */
 #define STRAIGHT_SPEED_PERCENT 50 /* 35..100 */
@@ -198,10 +199,13 @@ static bool button_pressed_event(void)
 void app_main(void)
 {
     configure_hardware();
+    ESP_ERROR_CHECK(tft18_sensor_display_init());
     const int speed = clamp_int(STRAIGHT_SPEED_PERCENT, 35, 100) *
                       (STRAIGHT_DIRECTION >= 0 ? 1 : -1);
     bool running = false;
     int64_t start_ms = 0;
+    uint8_t previous_ir = 0x10; /* impossible 4-bit value */
+    unsigned ir_log_divider = 0;
 
     ESP_LOGW(TAG, "先架空小车检查方向，再进行地面测试");
     ESP_LOGI(TAG, "FRONT WHEELS ONLY; rear GPIO12/13/14 locked LOW");
@@ -211,6 +215,18 @@ void app_main(void)
 
     while (true) {
         const int64_t now_ms = esp_timer_get_time() / 1000;
+        const uint8_t ir_raw = tft18_sensor_display_read_raw();
+        if (ir_raw != previous_ir) {
+            ESP_ERROR_CHECK(tft18_sensor_display_update(ir_raw));
+            previous_ir = ir_raw;
+        }
+        if (++ir_log_divider >= 50) {
+            ir_log_divider = 0;
+            ESP_LOGI(TAG, "OUT4..OUT1 raw=%d%d%d%d, black_mask=0x%X",
+                     (ir_raw >> 3) & 1, (ir_raw >> 2) & 1,
+                     (ir_raw >> 1) & 1, ir_raw & 1,
+                     (~ir_raw) & 0x0f);
+        }
         if (button_pressed_event()) {
             if (running) {
                 stop_chassis();
