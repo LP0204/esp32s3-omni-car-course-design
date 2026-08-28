@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "tft18_sensor_display.h"
 
 /* Motor D：左前轮。 */
 #define DIN1 GPIO_NUM_8
@@ -35,6 +36,7 @@ typedef struct {
     gpio_num_t in2;
     gpio_num_t pwm_gpio;
     ledc_channel_t pwm_channel;
+    int electrical_sign;
 } motor_t;
 
 typedef enum {
@@ -57,6 +59,7 @@ static motor_t motor_a = {
     .in2 = AIN2,
     .pwm_gpio = PWMA,
     .pwm_channel = LEDC_CHANNEL_2,
+    .electrical_sign = 1,
 };
 
 static motor_t motor_b = {
@@ -65,6 +68,7 @@ static motor_t motor_b = {
     .in2 = BIN2,
     .pwm_gpio = PWMB,
     .pwm_channel = LEDC_CHANNEL_1,
+    .electrical_sign = -1,
 };
 
 static motor_t motor_d = {
@@ -73,10 +77,36 @@ static motor_t motor_d = {
     .in2 = DIN2,
     .pwm_gpio = PWMD,
     .pwm_channel = LEDC_CHANNEL_0,
+    .electrical_sign = -1,
 };
 
 static int speed_percent = DEFAULT_SPEED_PERCENT;
 static motion_mode_t current_motion = MOTION_STOPPED;
+
+static void publish_motion_state(void)
+{
+    int left = 0;
+    int right = 0;
+    int back = 0;
+    switch (current_motion) {
+    case MOTION_A_FORWARD: right = speed_percent; break;
+    case MOTION_A_REVERSE: right = -speed_percent; break;
+    case MOTION_B_FORWARD: back = speed_percent; break;
+    case MOTION_B_REVERSE: back = -speed_percent; break;
+    case MOTION_D_FORWARD: left = speed_percent; break;
+    case MOTION_D_REVERSE: left = -speed_percent; break;
+    case MOTION_ALL_FORWARD:
+        left = right = back = speed_percent;
+        break;
+    case MOTION_ALL_REVERSE:
+        left = right = back = -speed_percent;
+        break;
+    case MOTION_STOPPED:
+    default:
+        break;
+    }
+    tft18_sensor_display_set_motor_commands(left, right, back);
+}
 
 static int clamp_speed(int value)
 {
@@ -114,6 +144,8 @@ static void stop_all_pwm(void)
 
 static void set_direction(motor_t *motor, int direction)
 {
+    /* Logical +1 always means clockwise chassis contribution. */
+    direction *= motor->electrical_sign;
     ESP_ERROR_CHECK(gpio_set_level(motor->in1, direction > 0));
     ESP_ERROR_CHECK(gpio_set_level(motor->in2, direction < 0));
 }
@@ -132,10 +164,11 @@ static void run_single(motor_t *motor,
     set_direction(motor, direction);
     set_pwm(motor, speed_percent);
     current_motion = new_motion;
+    publish_motion_state();
     ESP_LOGI(TAG,
              "%s %s，速度 %d%%",
              motor->name,
-             direction > 0 ? "正转" : "反转",
+             direction > 0 ? "逻辑+1（顺时针贡献方向）" : "逻辑-1（反方向）",
              speed_percent);
 }
 
@@ -149,9 +182,10 @@ static void run_all(int direction, motion_mode_t new_motion)
     set_pwm(&motor_b, speed_percent);
     set_pwm(&motor_d, speed_percent);
     current_motion = new_motion;
+    publish_motion_state();
     ESP_LOGI(TAG,
-             "三个电机同时%s，速度 %d%%",
-             direction > 0 ? "正转" : "反转",
+             "车体原地%s，速度 %d%%",
+             direction > 0 ? "顺时针" : "逆时针",
              speed_percent);
 }
 
@@ -159,6 +193,7 @@ static void stop_all(void)
 {
     stop_all_pwm();
     current_motion = MOTION_STOPPED;
+    publish_motion_state();
     ESP_LOGI(TAG, "所有电机已停止");
 }
 
@@ -193,6 +228,7 @@ static void set_speed(int requested_percent)
 {
     speed_percent = clamp_speed(requested_percent);
     update_running_speed();
+    publish_motion_state();
     ESP_LOGI(TAG, "速度设置为 %d%%", speed_percent);
     if (speed_percent < 30) {
         ESP_LOGW(TAG, "低于30%%时，电机可能只有声音而无法启动");
@@ -202,10 +238,10 @@ static void set_speed(int requested_percent)
 static void print_help(void)
 {
     ESP_LOGI(TAG, "========== 三轮电机测试命令 ==========");
-    ESP_LOGI(TAG, "A/a：Motor A（右前轮 GPIO15/16/17）正转/反转");
-    ESP_LOGI(TAG, "B/b：Motor B（后轮 GPIO12/13/14）正转/反转");
-    ESP_LOGI(TAG, "D/d：Motor D（左前轮 GPIO8/9/10）正转/反转");
-    ESP_LOGI(TAG, "F/R：三个电机同时正转/反转");
+    ESP_LOGI(TAG, "A/a：右前轮逻辑 +1/-1");
+    ESP_LOGI(TAG, "B/b：后轮逻辑 +1/-1");
+    ESP_LOGI(TAG, "D/d：左前轮逻辑 +1/-1");
+    ESP_LOGI(TAG, "F/R：车体原地顺时针/逆时针旋转");
     ESP_LOGI(TAG, "S：停止所有电机");
     ESP_LOGI(TAG, "+/-：速度增加/减少10%%");
     ESP_LOGI(TAG, "1~9：速度设为10%%~90%%，0：速度设为100%%");
@@ -331,6 +367,7 @@ static void handle_command(char command)
 void app_main(void)
 {
     configure_motor_hardware();
+    ESP_ERROR_CHECK(tft18_sensor_display_init());
     setvbuf(stdin, NULL, _IONBF, 0);
 
     ESP_LOGW(TAG, "测试前必须把小车架空");

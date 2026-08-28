@@ -1,3 +1,3 @@
-idf_component_register(SRCS "main.c"
+idf_component_register(SRCS "main.c" "tft18_sensor_display.c"
                        INCLUDE_DIRS "."
-                       REQUIRES esp_driver_gpio)
+                       REQUIRES esp_driver_gpio esp_driver_spi)

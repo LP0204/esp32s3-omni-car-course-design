@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -30,10 +31,19 @@
 #define COLOR_BLACK   0x0000
 #define COLOR_WHITE   0xFFFF
 #define COLOR_YELLOW  0xFFE0
+#define COLOR_GREEN   0x07E0
+#define DISPLAY_REFRESH_MS 200
 
 static const char *TAG = "SENSOR_DISPLAY";
 static spi_device_handle_t s_tft;
 static uint8_t s_frame[TFT_WIDTH * TFT_HEIGHT * 2];
+static portMUX_TYPE s_data_lock = portMUX_INITIALIZER_UNLOCKED;
+static int s_left_command;
+static int s_right_command;
+static int s_back_command;
+static int s_distance_mm = -1;
+static uint8_t s_ir_black_bits;
+static bool s_started;
 
 static esp_err_t tft_tx(const void *data, size_t length)
 {
@@ -226,13 +236,23 @@ static const uint8_t *glyph(char character)
         {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03},
         {0x36,0x49,0x49,0x49,0x36}, {0x06,0x49,0x49,0x29,0x1E},
     };
-    static const uint8_t black[5] = {0x7F,0x49,0x49,0x49,0x36};
-    static const uint8_t white[5] = {0x3F,0x40,0x38,0x40,0x3F};
-    if (character >= '0' && character <= '9') {
-        return digits[character - '0'];
-    }
-    if (character == 'B') return black;
-    if (character == 'W') return white;
+    static const uint8_t b[5] = {0x7F,0x49,0x49,0x49,0x36};
+    static const uint8_t l[5] = {0x7F,0x40,0x40,0x40,0x40};
+    static const uint8_t r[5] = {0x7F,0x09,0x19,0x29,0x46};
+    static const uint8_t d[5] = {0x7F,0x41,0x41,0x22,0x1C};
+    static const uint8_t colon[5] = {0x00,0x36,0x36,0x00,0x00};
+    static const uint8_t minus[5] = {0x08,0x08,0x08,0x08,0x08};
+    static const uint8_t dot[5] = {0x00,0x60,0x60,0x00,0x00};
+    static const uint8_t question[5] = {0x02,0x01,0x51,0x09,0x06};
+    if (character >= '0' && character <= '9') return digits[character - '0'];
+    if (character == 'B') return b;
+    if (character == 'L') return l;
+    if (character == 'R') return r;
+    if (character == 'D') return d;
+    if (character == ':') return colon;
+    if (character == '-') return minus;
+    if (character == '.') return dot;
+    if (character == '?') return question;
     return blank;
 }
 
@@ -251,6 +271,16 @@ static void frame_character(int x, int y, char character, int scale,
     }
 }
 
+static void frame_text(int x, int y, const char *text, int scale,
+                       uint16_t foreground, uint16_t background)
+{
+    while (*text != '\0') {
+        frame_character(x, y, *text, scale, foreground, background);
+        x += 6 * scale;
+        ++text;
+    }
+}
+
 static esp_err_t frame_show(void)
 {
     ESP_RETURN_ON_ERROR(tft_set_window(0, 0, TFT_WIDTH - 1,
@@ -260,8 +290,69 @@ static esp_err_t frame_show(void)
     return tft_tx(s_frame, sizeof(s_frame));
 }
 
+static void draw_full_ui(int left_command, int right_command,
+                         int back_command, int distance_mm,
+                         uint8_t ir_black_bits)
+{
+    char text[20];
+    frame_fill(COLOR_BLACK);
+    snprintf(text, sizeof(text), "L:%d", left_command);
+    frame_text(4, 4, text, 2, COLOR_GREEN, COLOR_BLACK);
+    snprintf(text, sizeof(text), "R:%d", right_command);
+    frame_text(4, 29, text, 2, COLOR_GREEN, COLOR_BLACK);
+    snprintf(text, sizeof(text), "B:%d", back_command);
+    frame_text(4, 54, text, 2, COLOR_GREEN, COLOR_BLACK);
+    if (distance_mm >= 0) {
+        snprintf(text, sizeof(text), "D:%d.%d", distance_mm / 10,
+                 distance_mm % 10);
+    } else {
+        snprintf(text, sizeof(text), "D:?");
+    }
+    frame_text(4, 79, text, 2, COLOR_YELLOW, COLOR_BLACK);
+
+    /* Physical left-to-right: OUT4, OUT3, OUT2, OUT1. */
+    for (int index = 0; index < 4; ++index) {
+        const bool black = ((ir_black_bits >> (3 - index)) & 1U) != 0;
+        const int x = 5 + index * 39;
+        frame_rect(x, 105, 33, 20, COLOR_YELLOW);
+        frame_rect(x + 2, 107, 29, 16, black ? COLOR_BLACK : COLOR_WHITE);
+    }
+}
+
+static void display_task(void *argument)
+{
+    (void)argument;
+    TickType_t last_wake = xTaskGetTickCount();
+    while (true) {
+        const uint8_t raw = tft18_sensor_display_read_raw();
+        int left_command;
+        int right_command;
+        int back_command;
+        int distance_mm;
+        uint8_t ir_black_bits;
+
+        portENTER_CRITICAL(&s_data_lock);
+        s_ir_black_bits = (uint8_t)(~raw) & 0x0f;
+        left_command = s_left_command;
+        right_command = s_right_command;
+        back_command = s_back_command;
+        distance_mm = s_distance_mm;
+        ir_black_bits = s_ir_black_bits;
+        portEXIT_CRITICAL(&s_data_lock);
+
+        draw_full_ui(left_command, right_command, back_command,
+                     distance_mm, ir_black_bits);
+        const esp_err_t error = frame_show();
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "frame update failed: %s", esp_err_to_name(error));
+        }
+        xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(DISPLAY_REFRESH_MS));
+    }
+}
+
 esp_err_t tft18_sensor_display_init(void)
 {
+    if (s_started) return ESP_OK;
     const gpio_config_t ir_gpio = {
         .pin_bit_mask = (1ULL << IR_OUT4) | (1ULL << IR_OUT3) |
                         (1ULL << IR_OUT2) | (1ULL << IR_OUT1),
@@ -270,7 +361,12 @@ esp_err_t tft18_sensor_display_init(void)
     };
     ESP_RETURN_ON_ERROR(gpio_config(&ir_gpio), TAG, "IR GPIO init failed");
     ESP_RETURN_ON_ERROR(tft_init(), TAG, "TFT init failed");
-    ESP_LOGI(TAG, "four-sensor display initialized");
+    if (xTaskCreate(display_task, "tft18_display", 3072, NULL, 1, NULL)
+        != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    s_started = true;
+    ESP_LOGI(TAG, "full TFT18 display task started");
     return ESP_OK;
 }
 
@@ -284,17 +380,33 @@ uint8_t tft18_sensor_display_read_raw(void)
 
 esp_err_t tft18_sensor_display_update(uint8_t raw)
 {
-    frame_fill(COLOR_BLACK);
-    for (int index = 0; index < 4; ++index) {
-        const bool is_black = ((raw >> index) & 1U) == 0;
-        const int x = 1 + index * 40;
-        const uint16_t fill = is_black ? COLOR_BLACK : COLOR_WHITE;
-        const uint16_t text = is_black ? COLOR_WHITE : COLOR_BLACK;
+    portENTER_CRITICAL(&s_data_lock);
+    s_ir_black_bits = (uint8_t)(~raw) & 0x0f;
+    portEXIT_CRITICAL(&s_data_lock);
+    return ESP_OK;
+}
 
-        frame_rect(x, 1, 38, 126, COLOR_YELLOW);
-        frame_rect(x + 2, 3, 34, 122, fill);
-        frame_character(x + 11, 22, (char)('1' + index), 2, text, fill);
-        frame_character(x + 11, 78, is_black ? 'B' : 'W', 2, text, fill);
-    }
-    return frame_show();
+static int clamp_command(int value)
+{
+    if (value > 100) return 100;
+    if (value < -100) return -100;
+    return value;
+}
+
+void tft18_sensor_display_set_motor_commands(int left_percent,
+                                              int right_percent,
+                                              int back_percent)
+{
+    portENTER_CRITICAL(&s_data_lock);
+    s_left_command = clamp_command(left_percent);
+    s_right_command = clamp_command(right_percent);
+    s_back_command = clamp_command(back_percent);
+    portEXIT_CRITICAL(&s_data_lock);
+}
+
+void tft18_sensor_display_set_distance_mm(int distance_mm)
+{
+    portENTER_CRITICAL(&s_data_lock);
+    s_distance_mm = distance_mm;
+    portEXIT_CRITICAL(&s_data_lock);
 }

@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "tft18_sensor_display.h"
 
 /*
  * 四路红外循迹模块接线：
@@ -13,6 +14,11 @@
  *   OUT2 -> GPIO5
  *   OUT3 -> GPIO6
  *   OUT4 -> GPIO7
+ *
+ * 从车头向前看，传感器物理顺序为：
+ *   最左 OUT4(GPIO7) -> 左二 OUT3(GPIO6)
+ *   -> 右二 OUT2(GPIO5) -> 最右 OUT1(GPIO4)
+ * 位图保持 bit3=OUT4 ... bit0=OUT1。
  *
  * 所给模块资料说明：黑色输出低电平，白色输出高电平。
  * 如果实测逻辑相反，把 BLACK_LEVEL 改为 1 即可。
@@ -68,9 +74,11 @@ void app_main(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&io_config));
+    ESP_ERROR_CHECK(tft18_sensor_display_init());
 
     ESP_LOGI(TAG, "四路红外黑白识别测试开始");
     ESP_LOGI(TAG, "接线: OUT1/2/3/4 -> GPIO4/5/6/7, VCC -> 3V3, GND -> GND");
+    ESP_LOGI(TAG, "从车头看左到右: OUT4 / OUT3 / OUT2 / OUT1");
     ESP_LOGI(TAG, "判定规则: 黑=%d, 白=%d", BLACK_LEVEL, 1 - BLACK_LEVEL);
 
     while (1) {
@@ -87,13 +95,13 @@ void app_main(void)
         }
 
         ESP_LOGI(TAG,
-                 "OUT1(GPIO4)=%d[%s]  OUT2(GPIO5)=%d[%s]  "
-                 "OUT3(GPIO6)=%d[%s]  OUT4(GPIO7)=%d[%s]  "
+                 "左->右: OUT4(GPIO7)=%d[%s]  OUT3(GPIO6)=%d[%s]  "
+                 "OUT2(GPIO5)=%d[%s]  OUT1(GPIO4)=%d[%s]  "
                  "raw=0x%X  黑色通道数=%d",
-                 level[0], surface_name(level[0]),
-                 level[1], surface_name(level[1]),
-                 level[2], surface_name(level[2]),
                  level[3], surface_name(level[3]),
+                 level[2], surface_name(level[2]),
+                 level[1], surface_name(level[1]),
+                 level[0], surface_name(level[0]),
                  raw_bits, black_count);
 
         vTaskDelay(pdMS_TO_TICKS(PRINT_INTERVAL_MS));

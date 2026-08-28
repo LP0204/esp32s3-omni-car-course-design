@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "tft18_sensor_display.h"
 
 /* ======================== User-adjustable parameters ======================== */
 #define TARGET_ANGLE_DEG 90.0f     /* positive=right, negative=left */
@@ -122,6 +123,7 @@ static void stop_chassis(void)
     motor_stop(&left_motor);
     motor_stop(&back_motor);
     motor_stop(&right_motor);
+    tft18_sensor_display_set_motor_commands(0, 0, 0);
 }
 
 static void rotate_chassis(int signed_power)
@@ -130,6 +132,9 @@ static void rotate_chassis(int signed_power)
     motor_write(&left_motor, signed_power);
     motor_write(&back_motor, signed_power);
     motor_write(&right_motor, signed_power);
+    tft18_sensor_display_set_motor_commands(signed_power,
+                                             signed_power,
+                                             signed_power);
 }
 
 static void configure_hardware(void)
@@ -195,6 +200,7 @@ static bool button_pressed_event(void)
 void app_main(void)
 {
     configure_hardware();
+    ESP_ERROR_CHECK(tft18_sensor_display_init());
     const float absolute_angle = TARGET_ANGLE_DEG >= 0.0f
                                      ? TARGET_ANGLE_DEG : -TARGET_ANGLE_DEG;
     const int64_t turn_duration_ms = (int64_t)(absolute_angle *
