@@ -23,13 +23,14 @@
 /* 1: line on the left slows the left wheel; set to -1 only if the car corrects oppositely. */
 #define STEERING_SIGN 1
 
-/*
- * The filtered all-white result is treated as a line disappearance.  Zero
- * makes the chassis stop on the first valid all-white sample, minimizing
- * overshoot.  Set to 10-20 ms only if the sensors produce occasional
- * all-white glitches and a short forward hold is really needed.
- */
-#define ALL_WHITE_STOP_DELAY_MS 0
+/* Fixed-angle action when the line disappears.  Negative is a left turn. */
+#define LINE_LOST_TURN_ANGLE_DEG (-90.0f)
+#define TURN_POWER_PERCENT 45
+#define TURN_MS_PER_DEGREE 8.0f
+
+/* After the turn, move slowly until a valid sensor pattern is reacquired. */
+#define REACQUIRE_POWER_PERCENT 35
+#define REACQUIRE_TIMEOUT_MS 300
 
 /* Logical +1 means this wheel contributes to clockwise chassis rotation. */
 #define LEFT_ELECTRICAL_SIGN (-1)
@@ -91,7 +92,8 @@ typedef enum {
     STATE_CORRECT_RIGHT,
     STATE_RECOVER_LEFT,
     STATE_RECOVER_RIGHT,
-    STATE_LOST_FORWARD,
+    STATE_TURN_LEFT,
+    STATE_REACQUIRE_LINE,
     STATE_FAULT_STOP,
 } line_state_t;
 
@@ -114,6 +116,12 @@ static motor_t right_motor = {
     .pwm_channel = LEDC_CHANNEL_2,
     .electrical_sign = RIGHT_ELECTRICAL_SIGN,
 };
+static motor_t back_motor = {
+    .in1 = BACK_IN1, .in2 = BACK_IN2, .pwm_gpio = BACK_PWM,
+    .pwm_channel = LEDC_CHANNEL_1,
+    .electrical_sign = -1,
+};
+static int turn_command_power = -TURN_POWER_PERCENT;
 
 static int clamp_int(int value, int minimum, int maximum)
 {
@@ -169,16 +177,14 @@ static void motor_write(motor_t *motor, int command_percent)
 
 static void lock_rear_wheel(void)
 {
-    ESP_ERROR_CHECK(gpio_set_level(BACK_IN1, 0));
-    ESP_ERROR_CHECK(gpio_set_level(BACK_IN2, 0));
-    ESP_ERROR_CHECK(gpio_set_level(BACK_PWM, 0));
+    motor_stop(&back_motor);
 }
 
 static void stop_chassis(void)
 {
     motor_stop(&left_motor);
     motor_stop(&right_motor);
-    lock_rear_wheel();
+    motor_stop(&back_motor);
     tft18_sensor_display_set_motor_commands(0, 0, 0);
 }
 
@@ -196,6 +202,17 @@ static void drive_front_wheels(int left_percent, int right_percent)
     motor_write(&left_motor, left_command);
     motor_write(&right_motor, right_command);
     tft18_sensor_display_set_motor_commands(left_command, right_command, 0);
+}
+
+static void rotate_chassis(int signed_power)
+{
+    /* Logical + commands rotate the chassis clockwise; negative is left. */
+    motor_write(&left_motor, signed_power);
+    motor_write(&back_motor, signed_power);
+    motor_write(&right_motor, signed_power);
+    tft18_sensor_display_set_motor_commands(signed_power,
+                                             signed_power,
+                                             signed_power);
 }
 
 static void drive_with_correction(int correction_direction, int correction)
@@ -235,8 +252,8 @@ static void configure_hardware(void)
     };
     ESP_ERROR_CHECK(ledc_timer_config(&timer));
 
-    motor_t *motors[] = {&left_motor, &right_motor};
-    for (int i = 0; i < 2; ++i) {
+    motor_t *motors[] = {&left_motor, &back_motor, &right_motor};
+    for (int i = 0; i < 3; ++i) {
         const ledc_channel_config_t channel = {
             .gpio_num = motors[i]->pwm_gpio,
             .speed_mode = LEDC_LOW_SPEED_MODE,
@@ -346,7 +363,8 @@ static const char *state_name(line_state_t state)
     case STATE_CORRECT_RIGHT: return "CORRECT_RIGHT";
     case STATE_RECOVER_LEFT: return "RECOVER_LEFT";
     case STATE_RECOVER_RIGHT: return "RECOVER_RIGHT";
-    case STATE_LOST_FORWARD: return "LOST_FORWARD";
+    case STATE_TURN_LEFT: return "TURN_LEFT";
+    case STATE_REACQUIRE_LINE: return "REACQUIRE_LINE";
     case STATE_FAULT_STOP: return "FAULT_STOP";
     default: return "UNKNOWN";
     }
@@ -370,8 +388,11 @@ static void apply_state(line_state_t state)
     case STATE_RECOVER_RIGHT:
         drive_with_correction(1, HARD_CORRECTION_PERCENT);
         break;
-    case STATE_LOST_FORWARD:
-        drive_front_wheels(LEFT_BASE_POWER_PERCENT, RIGHT_BASE_POWER_PERCENT);
+    case STATE_TURN_LEFT:
+        rotate_chassis(turn_command_power);
+        break;
+    case STATE_REACQUIRE_LINE:
+        drive_front_wheels(REACQUIRE_POWER_PERCENT, REACQUIRE_POWER_PERCENT);
         break;
     case STATE_STOPPED:
     case STATE_FAULT_STOP:
@@ -397,14 +418,25 @@ void app_main(void)
     bool running = false;
     line_state_t state = STATE_STOPPED;
     observation_filter_t observation_filter = {0};
-    int64_t lost_since_ms = -1;
+    const float absolute_turn_angle = LINE_LOST_TURN_ANGLE_DEG >= 0.0f
+                                          ? LINE_LOST_TURN_ANGLE_DEG
+                                          : -LINE_LOST_TURN_ANGLE_DEG;
+    const int64_t turn_duration_ms = (int64_t)(absolute_turn_angle *
+                                               TURN_MS_PER_DEGREE + 0.5f);
+    turn_command_power = (LINE_LOST_TURN_ANGLE_DEG >= 0.0f ? 1 : -1) *
+                         clamp_int(TURN_POWER_PERCENT,
+                                   MIN_EFFECTIVE_DUTY_PERCENT, 100);
+    int64_t turn_start_ms = -1;
+    int64_t reacquire_since_ms = -1;
     uint8_t previous_display_raw = 0x10;
     unsigned log_divider = 0;
 
     ESP_LOGW(TAG, "first test with wheels lifted; BOOT starts/stops tracking");
     ESP_LOGI(TAG, "OUT4/OUT3/OUT2/OUT1 = far-left/left-center/right-center/far-right");
-    ESP_LOGI(TAG, "base left=%d%% right=%d%%; rear wheel locked LOW",
-             LEFT_BASE_POWER_PERCENT, RIGHT_BASE_POWER_PERCENT);
+    ESP_LOGI(TAG, "base left=%d%% right=%d%%; line lost -> turn %.1f deg, power=%d%%, time=%lldms",
+             LEFT_BASE_POWER_PERCENT, RIGHT_BASE_POWER_PERCENT,
+             (double)LINE_LOST_TURN_ANGLE_DEG, abs(turn_command_power),
+             turn_duration_ms);
 
     while (true) {
         const int64_t now_ms = esp_timer_get_time() / 1000;
@@ -425,6 +457,8 @@ void app_main(void)
         if (button_pressed_event()) {
             if (running) {
                 running = false;
+                turn_start_ms = -1;
+                reacquire_since_ms = -1;
                 enter_state(&state, STATE_STOPPED);
                 ESP_LOGI(TAG, "manual stop");
             } else if (observed == OBS_LOST || observed == OBS_AMBIGUOUS) {
@@ -432,48 +466,74 @@ void app_main(void)
                 ESP_LOGW(TAG, "start rejected: place a center sensor on the black line");
             } else {
                 running = true;
-                lost_since_ms = -1;
+                turn_start_ms = -1;
+                reacquire_since_ms = -1;
                 ESP_LOGI(TAG, "tracking started");
             }
         }
 
         if (running) {
-            switch (observed) {
+            if (state == STATE_TURN_LEFT) {
+                if (now_ms - turn_start_ms >= turn_duration_ms) {
+                    reacquire_since_ms = now_ms;
+                    enter_state(&state, STATE_REACQUIRE_LINE);
+                    ESP_LOGI(TAG, "left turn finished; reacquiring line");
+                }
+                /* Keep the timed three-wheel turn active until its duration
+                 * expires; sensor values are intentionally ignored here. */
+            } else {
+                /* During reacquisition, use the freshly filtered pattern
+                 * immediately instead of the pre-turn confirmation history. */
+                const line_observation_t control_observed =
+                    (state == STATE_REACQUIRE_LINE) ? measured : observed;
+
+                switch (control_observed) {
             case OBS_CENTERED:
-                lost_since_ms = -1;
+                reacquire_since_ms = -1;
                 enter_state(&state, STATE_TRACK_CENTER);
                 break;
 
             case OBS_LINE_LEFT:
-                lost_since_ms = -1;
+                reacquire_since_ms = -1;
                 enter_state(&state, STATE_CORRECT_LEFT);
                 break;
 
             case OBS_LINE_RIGHT:
-                lost_since_ms = -1;
+                reacquire_since_ms = -1;
                 enter_state(&state, STATE_CORRECT_RIGHT);
                 break;
 
             case OBS_FAR_LEFT:
-                lost_since_ms = -1;
+                reacquire_since_ms = -1;
                 enter_state(&state, STATE_RECOVER_LEFT);
                 break;
 
             case OBS_FAR_RIGHT:
-                lost_since_ms = -1;
+                reacquire_since_ms = -1;
                 enter_state(&state, STATE_RECOVER_RIGHT);
                 break;
 
             case OBS_LOST:
-                if (lost_since_ms < 0) lost_since_ms = now_ms;
-                if (now_ms - lost_since_ms >= ALL_WHITE_STOP_DELAY_MS) {
-                    running = false;
-                    enter_state(&state, STATE_FAULT_STOP);
-                    ESP_LOGW(TAG, "all sensors white; line disappeared; stopped immediately");
+                if (state == STATE_REACQUIRE_LINE) {
+                    if (reacquire_since_ms < 0) reacquire_since_ms = now_ms;
+                    if (now_ms - reacquire_since_ms >= REACQUIRE_TIMEOUT_MS) {
+                        running = false;
+                        enter_state(&state, STATE_FAULT_STOP);
+                        ESP_LOGW(TAG, "line not reacquired within %d ms; stopped",
+                                 REACQUIRE_TIMEOUT_MS);
+                    }
                 } else {
-                    /* Optional tolerance, enabled only when the parameter is
-                     * changed above zero. */
-                    enter_state(&state, STATE_LOST_FORWARD);
+                    if (turn_duration_ms <= 0) {
+                        running = false;
+                        enter_state(&state, STATE_FAULT_STOP);
+                        ESP_LOGW(TAG, "invalid turn duration; stopped");
+                    } else {
+                        turn_start_ms = now_ms;
+                        reacquire_since_ms = -1;
+                        enter_state(&state, STATE_TURN_LEFT);
+                        ESP_LOGW(TAG, "all sensors white; turning %.1f deg",
+                                 (double)LINE_LOST_TURN_ANGLE_DEG);
+                    }
                 }
                 break;
 
@@ -483,6 +543,7 @@ void app_main(void)
                 enter_state(&state, STATE_FAULT_STOP);
                 ESP_LOGW(TAG, "ambiguous sensor pattern 0x%X; stopped", black_mask);
                 break;
+                }
             }
         }
 
