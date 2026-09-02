@@ -8,6 +8,8 @@
 **/sdkconfig
 **/sdkconfig.old
 **/managed_components/
+**/include/libuvc/libuvc_config.h
+**/.venv/
 
 # Local editor configuration
 **/.vscode/
@@ -15,3 +17,5 @@
 # Temporary files
 *.log
 *.tmp
+**/__pycache__/
+*.pyc
