@@ -136,14 +136,18 @@ def parse_frames(buffer: bytearray) -> None:
 
 
 HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<title>ESP32-S3 摄像头彩色图</title><style>
+<title>ESP32-S3 摄像头彩色分类</title><style>
 body{margin:0;background:#202124;color:#eee;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-align:center}
 h2{font-size:21px;font-weight:500;margin:18px 0 6px}#status{color:#b9c1cc;margin:0 0 14px}
-canvas{width:min(900px,94vw);height:auto;max-height:78vh;background:#111;border:1px solid #4a4f57;image-rendering:pixelated}
-p{color:#9aa4b2;font-size:13px}</style></head><body><h2>ESP32-S3 摄像头实时彩色图</h2>
-<div id="status">等待图像帧…</div><canvas id="image"></canvas><p>80×60 RGB 彩色预览；本工程不控制电机。</p>
-<script>const canvas=document.getElementById('image'),ctx=canvas.getContext('2d'),status=document.getElementById('status');let last=-1;
-function draw(p,w,h){if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}const image=ctx.createImageData(w,h);for(let i=0;i<w*h;i++){const v=p[i*2]|(p[i*2+1]<<8),j=i*4;image.data[j]=((v>>11)&31)*255/31;image.data[j+1]=((v>>5)&63)*255/63;image.data[j+2]=(v&31)*255/31;image.data[j+3]=255}ctx.putImageData(image,0,0)}
+.views{display:flex;justify-content:center;gap:18px;flex-wrap:wrap}.view{display:flex;flex-direction:column;gap:8px}
+canvas{width:min(680px,46vw);height:auto;max-width:94vw;max-height:76vh;background:#111;border:1px solid #4a4f57;image-rendering:pixelated}
+p{color:#9aa4b2;font-size:13px}</style></head><body><h2>ESP32-S3 摄像头实时彩色分类</h2>
+<div id="status">等待图像帧…</div><div class="views"><div class="view"><span>原始彩色图</span><canvas id="image"></canvas></div><div class="view"><span>红 / 绿 / 黑 / 白 分类图</span><canvas id="classify"></canvas></div></div>
+<p>黑色优先；红、绿按颜色优势判定；其余像素默认为白色。本工程不控制电机。</p>
+<script>const canvas=document.getElementById('image'),ctx=canvas.getContext('2d'),classCanvas=document.getElementById('classify'),classCtx=classCanvas.getContext('2d'),status=document.getElementById('status');let last=-1;
+function rgb565(p,i){const v=p[i*2]|(p[i*2+1]<<8);return [((v>>11)&31)*255/31,((v>>5)&63)*255/63,(v&31)*255/31]}
+function classify(r,g,b){const brightness=(r+g+b)/3,redness=r-(g+b)/2,greenness=g-(r+b)/2;if(brightness<55)return [0,0,0];if(redness>50&&r>90)return [230,45,45];if(greenness>42&&g>75)return [35,190,70];return [255,255,255]}
+function draw(p,w,h){if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;classCanvas.width=w;classCanvas.height=h}const image=ctx.createImageData(w,h),classes=classCtx.createImageData(w,h);for(let i=0;i<w*h;i++){const [r,g,b]=rgb565(p,i),j=i*4,c=classify(r,g,b);image.data[j]=r;image.data[j+1]=g;image.data[j+2]=b;image.data[j+3]=255;classes.data[j]=c[0];classes.data[j+1]=c[1];classes.data[j+2]=c[2];classes.data[j+3]=255}ctx.putImageData(image,0,0);classCtx.putImageData(classes,0,0)}
 async function update(){try{const s=await fetch('/status',{cache:'no-store'}),info=await s.json();status.textContent=info.status;if(!info.ready||info.frames===last)return;last=info.frames;const r=await fetch('/frame',{cache:'no-store'});if(!r.ok)return;draw(new Uint8Array(await r.arrayBuffer()),Number(r.headers.get('X-Width')),Number(r.headers.get('X-Height')))}catch(e){status.textContent='查看器连接异常：'+e}}setInterval(update,40);update();</script></body></html>"""
 
 
