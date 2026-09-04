@@ -11,6 +11,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 try:
     import serial
@@ -149,7 +150,7 @@ p{color:#9aa4b2;font-size:13px}</style></head><body><h2>ESP32-S3 摄像头实时
 function rgb565(p,i){const v=p[i*2]|(p[i*2+1]<<8);return [((v>>11)&31)*255/31,((v>>5)&63)*255/63,(v&31)*255/31]}
 function classify(r,g,b){const redness=r-(g+b)/2;if(redness>Number(red.value)&&r>90)return [230,45,45];return [255,255,255]}
 function draw(p,w,h){lastPixels=p;lastWidth=w;lastHeight=h;if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;classCanvas.width=w;classCanvas.height=h}const image=ctx.createImageData(w,h),classes=classCtx.createImageData(w,h);for(let i=0;i<w*h;i++){const [r,g,b]=rgb565(p,i),j=i*4,c=classify(r,g,b);image.data[j]=r;image.data[j+1]=g;image.data[j+2]=b;image.data[j+3]=255;classes.data[j]=c[0];classes.data[j+1]=c[1];classes.data[j+2]=c[2];classes.data[j+3]=255}ctx.putImageData(image,0,0);classCtx.putImageData(classes,0,0)}
-function updateControls(){document.getElementById('redValue').textContent=red.value;if(lastPixels)draw(lastPixels,lastWidth,lastHeight)}red.addEventListener('input',updateControls);
+let thresholdTimer=null;function updateControls(){document.getElementById('redValue').textContent=red.value;if(lastPixels)draw(lastPixels,lastWidth,lastHeight);clearTimeout(thresholdTimer);thresholdTimer=setTimeout(()=>fetch('/threshold?value='+red.value,{cache:'no-store'}),100)}red.addEventListener('input',updateControls);updateControls();
 async function update(){try{const s=await fetch('/status',{cache:'no-store'}),info=await s.json();status.textContent=info.status;if(!info.ready||info.frames===last)return;last=info.frames;const r=await fetch('/frame',{cache:'no-store'});if(!r.ok)return;draw(new Uint8Array(await r.arrayBuffer()),Number(r.headers.get('X-Width')),Number(r.headers.get('X-Height')))}catch(e){status.textContent='查看器连接异常：'+e}}setInterval(update,40);update();</script></body></html>"""
 
 
@@ -192,6 +193,21 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(frame)))
             self.end_headers()
             self.wfile.write(frame)
+            return
+        if self.path.startswith("/threshold"):
+            try:
+                value = int(parse_qs(urlparse(self.path).query).get("value", ["71"])[0])
+                value = max(0, min(160, value))
+                self.link.send(b"r" + bytes([value]))
+                body = json.dumps({"red_threshold": value}).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (ValueError, OSError):
+                self.send_error(HTTPStatus.BAD_REQUEST, "invalid threshold")
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 

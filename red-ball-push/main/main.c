@@ -70,12 +70,21 @@ static const char *TAG = "RED_BALL";
 #define MAX_PROFILES 8
 
 /* Red-ball control: deliberately only one colour metric. */
-#define REDNESS_THRESHOLD 71
+#define DEFAULT_REDNESS_THRESHOLD 71
 #define RED_MIN_CHANNEL 90
 #define RED_PIXELS_TO_TRIGGER 20
 #define RED_CONFIRM_FRAMES 3
-#define PUSH_POWER_PERCENT 52
+#define CENTER_CONFIRM_FRAMES 3
+#define CENTER_DEADBAND_PX 3
+#define CENTER_FINE_ZONE_PX 10
+#define ALIGN_LOST_FRAME_LIMIT 3
+#define SEARCH_LEFT_POWER 20
+#define ALIGN_COARSE_POWER 23
+#define ALIGN_FINE_POWER 18
+#define LEFT_STRAIGHT_POWER_PERCENT 52
+#define RIGHT_STRAIGHT_POWER_PERCENT 52
 #define PUSH_FORWARD_MS 900
+#define PUSH_PAUSE_MS 500
 #define PUSH_RETURN_MS 930
 
 /* 接线情况2。直行仅驱动两前轮；后轮停止。 */
@@ -108,7 +117,9 @@ static volatile uint32_t s_camera_frame_count;
 static uint8_t s_color[STREAM_COLOR_BYTES];
 static uint8_t s_serial_frame[STREAM_FRAME_BYTES];
 static volatile bool s_stream_enabled;
+static volatile uint8_t s_redness_threshold = DEFAULT_REDNESS_THRESHOLD;
 static volatile uint16_t s_red_pixels;
+static volatile int16_t s_red_center_x = STREAM_WIDTH / 2;
 static volatile uint32_t s_red_sequence;
 
 static uint8_t s_device_addr;
@@ -196,15 +207,20 @@ static void make_stream_color(const uint8_t *rgb565, size_t stride,
 static void update_red_measurement(void)
 {
     uint16_t count = 0;
+    uint32_t x_sum = 0;
     for (size_t i = 0; i < STREAM_PIXELS; ++i) {
         const uint16_t value = (uint16_t)(s_color[i * 2U] | ((uint16_t)s_color[i * 2U + 1U] << 8));
         const int red = ((value >> 11) & 0x1fU) * 255 / 31;
         const int green = ((value >> 5) & 0x3fU) * 255 / 63;
         const int blue = (value & 0x1fU) * 255 / 31;
         const int redness = red - (green + blue) / 2;
-        if (red > RED_MIN_CHANNEL && redness > REDNESS_THRESHOLD) ++count;
+        if (red > RED_MIN_CHANNEL && redness > s_redness_threshold) {
+            ++count;
+            x_sum += (uint32_t)(i % STREAM_WIDTH);
+        }
     }
     s_red_pixels = count;
+    if (count > 0) s_red_center_x = (int16_t)(x_sum / count);
     ++s_red_sequence;
 }
 
@@ -244,9 +260,22 @@ static void chassis_straight(bool forward)
     const int sign = forward ? 1 : -1;
     motor_write(BACK_IN1, BACK_IN2, LEDC_CHANNEL_1, -1, 0);
     motor_write(LEFT_IN1, LEFT_IN2, LEDC_CHANNEL_0, LEFT_ELECTRICAL_SIGN,
-                sign * LEFT_FORWARD_SIGN * PUSH_POWER_PERCENT);
+                sign * LEFT_FORWARD_SIGN * LEFT_STRAIGHT_POWER_PERCENT);
     motor_write(RIGHT_IN1, RIGHT_IN2, LEDC_CHANNEL_2, RIGHT_ELECTRICAL_SIGN,
-                sign * RIGHT_FORWARD_SIGN * PUSH_POWER_PERCENT);
+                sign * RIGHT_FORWARD_SIGN * RIGHT_STRAIGHT_POWER_PERCENT);
+}
+
+/* The project-wide motor convention is: a positive command on all three
+ * wheels rotates the chassis clockwise.  Therefore a negative command is a
+ * left/counter-clockwise rotation. */
+static void chassis_rotate(int clockwise_percent)
+{
+    motor_write(LEFT_IN1, LEFT_IN2, LEDC_CHANNEL_0, LEFT_ELECTRICAL_SIGN,
+                clockwise_percent);
+    motor_write(BACK_IN1, BACK_IN2, LEDC_CHANNEL_1, -1,
+                clockwise_percent);
+    motor_write(RIGHT_IN1, RIGHT_IN2, LEDC_CHANNEL_2, RIGHT_ELECTRICAL_SIGN,
+                clockwise_percent);
 }
 
 static void configure_motor_hardware(void)
@@ -607,7 +636,7 @@ static void serial_command_task(void *argument)
     printf("\n=== ESP32-S3 Camera Image Viewer ===\n");
     printf("Camera: %s; D-=GPIO%d, D+=GPIO%d; serial=%d baud\n",
            CAMERA_MODEL_NAME, USB_D_MINUS_GPIO, USB_D_PLUS_GPIO, STREAM_BAUD);
-    printf("Commands: v=start colour stream, x=stop\n");
+    printf("Commands: v=start colour stream, x=stop, r<byte>=red threshold\n");
     printf("Run tools/color_viewer.py on the Mac; it automatically sends v.\n\n");
 
     while (true) {
@@ -622,6 +651,14 @@ static void serial_command_task(void *argument)
             s_stream_enabled = false;
             printf("colour stream OFF\n");
             break;
+        case 'r': case 'R': {
+            const int threshold = getchar();
+            if (threshold != EOF) {
+                s_redness_threshold = (uint8_t)threshold;
+                printf("red threshold=%u\n", s_redness_threshold);
+            }
+            break;
+        }
         default:
             printf("commands: v / x\n");
             break;
@@ -632,18 +669,30 @@ static void serial_command_task(void *argument)
 typedef enum {
     RED_IDLE,
     RED_SEARCH,
+    RED_ALIGN,
     RED_PUSH,
+    RED_PAUSE,
     RED_RETURN,
     RED_COMPLETE,
 } red_state_t;
 
 static bool boot_pressed(void)
 {
-    static int previous = 1;
-    const int level = gpio_get_level(BUTTON_GPIO);
-    const bool pressed = previous == 1 && level == 0;
-    previous = level;
-    return pressed;
+    static int raw_previous = 1;
+    static int stable_level = 1;
+    static int64_t raw_changed_us = 0;
+    const int64_t now_us = esp_timer_get_time();
+    const int raw_level = gpio_get_level(BUTTON_GPIO);
+
+    if (raw_level != raw_previous) {
+        raw_previous = raw_level;
+        raw_changed_us = now_us;
+    }
+    if (raw_level != stable_level && now_us - raw_changed_us >= 40000) {
+        stable_level = raw_level;
+        return stable_level == 0;
+    }
+    return false;
 }
 
 static void red_ball_control_task(void *argument)
@@ -651,36 +700,97 @@ static void red_ball_control_task(void *argument)
     (void)argument;
     red_state_t state = RED_IDLE;
     uint32_t seen_sequence = 0;
-    int confirmations = 0;
+    int detect_confirmations = 0;
+    int center_confirmations = 0;
+    int lost_frames = 0;
     int64_t state_started_ms = 0;
     while (true) {
         const int64_t now_ms = esp_timer_get_time() / 1000;
         if (boot_pressed()) {
             if (state == RED_IDLE || state == RED_COMPLETE) {
                 state = RED_SEARCH;
-                confirmations = 0;
-                ESP_LOGI(TAG, "BOOT: searching red ball");
+                detect_confirmations = 0;
+                center_confirmations = 0;
+                lost_frames = 0;
+                chassis_rotate(-SEARCH_LEFT_POWER);
+                ESP_LOGI(TAG, "BOOT: searching red ball, rotating left at %d%%",
+                         SEARCH_LEFT_POWER);
             } else {
                 state = RED_IDLE;
                 chassis_stop();
                 ESP_LOGI(TAG, "BOOT: stopped");
             }
         }
-        if (state == RED_SEARCH && s_red_sequence != seen_sequence) {
+
+        if ((state == RED_SEARCH || state == RED_ALIGN) &&
+            s_red_sequence != seen_sequence) {
             seen_sequence = s_red_sequence;
-            confirmations = s_red_pixels >= RED_PIXELS_TO_TRIGGER ? confirmations + 1 : 0;
-            if (confirmations >= RED_CONFIRM_FRAMES) {
-                state = RED_PUSH;
-                state_started_ms = now_ms;
-                ESP_LOGI(TAG, "red ball found: %u pixels; pushing", s_red_pixels);
+            const bool red_detected = s_red_pixels >= RED_PIXELS_TO_TRIGGER;
+
+            if (state == RED_SEARCH) {
+                detect_confirmations = red_detected ? detect_confirmations + 1 : 0;
+                if (detect_confirmations >= RED_CONFIRM_FRAMES) {
+                    state = RED_ALIGN;
+                    center_confirmations = 0;
+                    lost_frames = 0;
+                    ESP_LOGI(TAG, "red detected: pixels=%u center_x=%d; aligning",
+                             s_red_pixels, s_red_center_x);
+                }
+            }
+
+            if (state == RED_ALIGN) {
+                if (!red_detected) {
+                    ++lost_frames;
+                    center_confirmations = 0;
+                    if (lost_frames >= ALIGN_LOST_FRAME_LIMIT) {
+                        state = RED_SEARCH;
+                        detect_confirmations = 0;
+                        chassis_rotate(-SEARCH_LEFT_POWER);
+                        ESP_LOGW(TAG, "red lost while aligning; resume left search");
+                    }
+                } else {
+                    lost_frames = 0;
+                    const int error = s_red_center_x - STREAM_WIDTH / 2;
+                    const int distance = abs(error);
+                    if (distance <= CENTER_DEADBAND_PX) {
+                        chassis_stop();
+                        ++center_confirmations;
+                        if (center_confirmations >= CENTER_CONFIRM_FRAMES) {
+                            state = RED_PUSH;
+                            state_started_ms = now_ms;
+                            ESP_LOGI(TAG,
+                                     "red centered: x=%d pixels=%u; push forward",
+                                     s_red_center_x, s_red_pixels);
+                        }
+                    } else {
+                        center_confirmations = 0;
+                        const int power = distance <= CENTER_FINE_ZONE_PX ?
+                                          ALIGN_FINE_POWER : ALIGN_COARSE_POWER;
+                        /* Target left of centre -> rotate left.  If it crosses
+                         * the centre, error changes sign and the chassis
+                         * automatically rotates back to correct overshoot. */
+                        chassis_rotate(error < 0 ? -power : power);
+                    }
+                }
             }
         }
-        if (state == RED_PUSH) {
+
+        if (state == RED_SEARCH) {
+            chassis_rotate(-SEARCH_LEFT_POWER);
+        } else if (state == RED_PUSH) {
             chassis_straight(true);
             if (now_ms - state_started_ms >= PUSH_FORWARD_MS) {
                 chassis_stop();
+                state = RED_PAUSE;
+                state_started_ms = now_ms;
+                ESP_LOGI(TAG, "forward complete; pause");
+            }
+        } else if (state == RED_PAUSE) {
+            chassis_stop();
+            if (now_ms - state_started_ms >= PUSH_PAUSE_MS) {
                 state = RED_RETURN;
                 state_started_ms = now_ms;
+                ESP_LOGI(TAG, "pause complete; return backward");
             }
         } else if (state == RED_RETURN) {
             chassis_straight(false);
