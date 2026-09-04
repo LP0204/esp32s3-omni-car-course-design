@@ -1,25 +1,23 @@
 /*
  * ESP32-S3 red-ball push controller
  *
- * The UVC camera pipeline below is retained from the verified
- * camera-color-viewer project. Motor control is isolated in its own task.
+ * The UVC camera pipeline is derived from the verified camera-color-viewer
+ * project. This version runs fully on the ESP32-S3 and does not transmit
+ * images to a computer.
  *
  * Data path (adapted for the JQ-CAM12-720D-V1 reference project):
- * UVC MJPEG camera -> usb_host_uvc v2 -> esp_jpeg -> 80x60 RGB565 image
- * -> CRC-protected UART packet -> tools/color_viewer.py -> Mac browser.
+ * UVC MJPEG camera -> usb_host_uvc v2 -> esp_jpeg -> 80x60 red sampling
+ * -> red centroid -> motor state machine.
  */
 
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
-#include "driver/uart.h"
-#include "driver/uart_vfs.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_intr_alloc.h"
@@ -48,17 +46,12 @@ static const char *TAG = "RED_BALL";
 #define DECODE_BUFFER_BYTES (DECODE_MAX_W * DECODE_MAX_H * 2U)
 #define JPEG_WORK_BYTES 4096
 
-/* The camera captures 720p. An 80x60 RGB565 preview preserves colour while
- * staying within the 921600-baud UART bandwidth. */
-#define STREAM_WIDTH 80
-#define STREAM_HEIGHT 60
-#define STREAM_PIXELS (STREAM_WIDTH * STREAM_HEIGHT)
-#define STREAM_COLOR_BYTES (STREAM_PIXELS * 2U)
-#define STREAM_FRAME_BYTES (4U + 2U + 2U + STREAM_COLOR_BYTES + 2U)
-#define STREAM_BAUD 921600
-/* An 80x60 RGB565 frame takes about 105 ms to send at 921600 baud. */
-#define FRAME_DECODE_MIN_GAP_US (120U * 1000U)
-#define DECODE_TASK_YIELD_MS 10
+/* Red detection samples 80x60 points directly from the decoded frame. */
+#define RED_MAP_WIDTH 80
+#define RED_MAP_HEIGHT 60
+#define RED_PROCESS_PERIOD_US (100U * 1000U) /* 10 FPS target. */
+#define DECODE_TASK_YIELD_MS 2
+#define CAMERA_REQUEST_FPS 10.0f
 
 /* This matches the normal physical camera mounting on the car. Set to 0 if
  * you deliberately want the unrotated raw orientation. */
@@ -70,19 +63,21 @@ static const char *TAG = "RED_BALL";
 #define MAX_PROFILES 8
 
 /* Red-ball control: deliberately only one colour metric. */
-#define DEFAULT_REDNESS_THRESHOLD 71
+#define REDNESS_THRESHOLD 90
 #define RED_MIN_CHANNEL 90
 #define RED_PIXELS_TO_TRIGGER 20
 #define RED_CONFIRM_FRAMES 3
 #define CENTER_CONFIRM_FRAMES 3
-#define CENTER_DEADBAND_PX 3
-#define CENTER_FINE_ZONE_PX 10
+#define CENTER_DEADBAND_PX 5
 #define ALIGN_LOST_FRAME_LIMIT 3
-#define SEARCH_LEFT_POWER 20
-#define ALIGN_COARSE_POWER 23
-#define ALIGN_FINE_POWER 18
-#define LEFT_STRAIGHT_POWER_PERCENT 52
-#define RIGHT_STRAIGHT_POWER_PERCENT 52
+#define TURN_STEP_POWER 120
+#define SEARCH_STEP_MS 200
+#define ALIGN_INITIAL_STEP_MS 80
+#define ALIGN_MIN_STEP_MS 20
+#define TURN_BRAKE_MS 35
+#define TURN_SETTLE_MS 120
+#define LEFT_STRAIGHT_POWER_PERCENT 51
+#define RIGHT_STRAIGHT_POWER_PERCENT 65
 #define PUSH_FORWARD_MS 900
 #define PUSH_PAUSE_MS 500
 #define PUSH_RETURN_MS 930
@@ -112,14 +107,9 @@ static uint8_t s_jpeg_work[JPEG_WORK_BYTES];
 static volatile size_t s_jpeg_size;
 static volatile uint32_t s_input_width;
 static volatile uint32_t s_input_height;
-static volatile uint32_t s_camera_frame_count;
 
-static uint8_t s_color[STREAM_COLOR_BYTES];
-static uint8_t s_serial_frame[STREAM_FRAME_BYTES];
-static volatile bool s_stream_enabled;
-static volatile uint8_t s_redness_threshold = DEFAULT_REDNESS_THRESHOLD;
 static volatile uint16_t s_red_pixels;
-static volatile int16_t s_red_center_x = STREAM_WIDTH / 2;
+static volatile int16_t s_red_center_x = RED_MAP_WIDTH / 2;
 static volatile uint32_t s_red_sequence;
 
 static uint8_t s_device_addr;
@@ -141,82 +131,28 @@ static const char *format_name(enum uvc_host_stream_format format)
     }
 }
 
-static uint16_t crc16_xmodem(const uint8_t *data, size_t length)
-{
-    uint16_t crc = 0;
-    for (size_t i = 0; i < length; ++i) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int bit = 0; bit < 8; ++bit) {
-            crc = (crc & 0x8000U) ? (uint16_t)((crc << 1) ^ 0x1021U)
-                                   : (uint16_t)(crc << 1);
-        }
-    }
-    return crc;
-}
-
-static void send_color_frame(void)
-{
-    const size_t payload_offset = 8;
-    s_serial_frame[0] = 'R';
-    s_serial_frame[1] = 'G';
-    s_serial_frame[2] = 'B';
-    s_serial_frame[3] = '5';
-    s_serial_frame[4] = STREAM_WIDTH & 0xff;
-    s_serial_frame[5] = STREAM_WIDTH >> 8;
-    s_serial_frame[6] = STREAM_HEIGHT & 0xff;
-    s_serial_frame[7] = STREAM_HEIGHT >> 8;
-    memcpy(s_serial_frame + payload_offset, s_color, STREAM_COLOR_BYTES);
-
-    const uint16_t crc = crc16_xmodem(s_color, STREAM_COLOR_BYTES);
-    s_serial_frame[payload_offset + STREAM_COLOR_BYTES] = crc & 0xff;
-    s_serial_frame[payload_offset + STREAM_COLOR_BYTES + 1] = crc >> 8;
-
-    /* One write prevents a second task from splitting a binary image packet. */
-    uart_write_bytes(UART_NUM_0, s_serial_frame, sizeof(s_serial_frame));
-}
-
-static void make_stream_color(const uint8_t *rgb565, size_t stride,
-                              uint32_t width, uint32_t height)
-{
-    for (int y = 0; y < STREAM_HEIGHT; ++y) {
-        const uint32_t source_y = (uint32_t)y * height / STREAM_HEIGHT;
-        const uint8_t *row = rgb565 + (size_t)source_y * stride;
-        for (int x = 0; x < STREAM_WIDTH; ++x) {
-            const uint32_t source_x = (uint32_t)x * width / STREAM_WIDTH;
-            const size_t destination = ((size_t)y * STREAM_WIDTH + x) * 2U;
-            const uint8_t *source = row + source_x * 2U;
-            s_color[destination] = source[0];
-            s_color[destination + 1U] = source[1];
-        }
-    }
-
-#if CAMERA_ROTATE_180
-    for (size_t i = 0; i < STREAM_PIXELS / 2U; ++i) {
-        const size_t first = i * 2U;
-        const size_t second = (STREAM_PIXELS - 1U - i) * 2U;
-        const uint8_t low = s_color[first];
-        const uint8_t high = s_color[first + 1U];
-        s_color[first] = s_color[second];
-        s_color[first + 1U] = s_color[second + 1U];
-        s_color[second] = low;
-        s_color[second + 1U] = high;
-    }
-#endif
-}
-
-static void update_red_measurement(void)
+static void update_red_measurement(const uint8_t *rgb565, size_t stride,
+                                   uint32_t width, uint32_t height)
 {
     uint16_t count = 0;
     uint32_t x_sum = 0;
-    for (size_t i = 0; i < STREAM_PIXELS; ++i) {
-        const uint16_t value = (uint16_t)(s_color[i * 2U] | ((uint16_t)s_color[i * 2U + 1U] << 8));
-        const int red = ((value >> 11) & 0x1fU) * 255 / 31;
-        const int green = ((value >> 5) & 0x3fU) * 255 / 63;
-        const int blue = (value & 0x1fU) * 255 / 31;
-        const int redness = red - (green + blue) / 2;
-        if (red > RED_MIN_CHANNEL && redness > s_redness_threshold) {
-            ++count;
-            x_sum += (uint32_t)(i % STREAM_WIDTH);
+    for (int y = 0; y < RED_MAP_HEIGHT; ++y) {
+        const uint32_t source_y = (uint32_t)y * height / RED_MAP_HEIGHT;
+        const uint8_t *row = rgb565 + (size_t)source_y * stride;
+        for (int x = 0; x < RED_MAP_WIDTH; ++x) {
+            const uint32_t source_x = (uint32_t)x * width / RED_MAP_WIDTH;
+            const uint8_t *source = row + source_x * 2U;
+            const uint16_t value = (uint16_t)(source[0] | ((uint16_t)source[1] << 8));
+            const int red = ((value >> 11) & 0x1fU) * 255 / 31;
+            const int green = ((value >> 5) & 0x3fU) * 255 / 63;
+            const int blue = (value & 0x1fU) * 255 / 31;
+            const int redness = red - (green + blue) / 2;
+            if (red > RED_MIN_CHANNEL && redness > REDNESS_THRESHOLD) {
+                const int logical_x = CAMERA_ROTATE_180 ?
+                                      RED_MAP_WIDTH - 1 - x : x;
+                ++count;
+                x_sum += (uint32_t)logical_x;
+            }
         }
     }
     s_red_pixels = count;
@@ -253,6 +189,23 @@ static void chassis_stop(void)
     motor_write(LEFT_IN1, LEFT_IN2, LEDC_CHANNEL_0, LEFT_ELECTRICAL_SIGN, 0);
     motor_write(BACK_IN1, BACK_IN2, LEDC_CHANNEL_1, -1, 0);
     motor_write(RIGHT_IN1, RIGHT_IN2, LEDC_CHANNEL_2, RIGHT_ELECTRICAL_SIGN, 0);
+}
+
+static void motor_brake(gpio_num_t in1, gpio_num_t in2, ledc_channel_t channel)
+{
+    ESP_ERROR_CHECK(gpio_set_level(in1, 1));
+    ESP_ERROR_CHECK(gpio_set_level(in2, 1));
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, channel,
+                                  (1U << LEDC_TIMER_10_BIT) - 1U));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, channel));
+}
+
+/* Short brake after each turn pulse suppresses mechanical coasting. */
+static void chassis_brake(void)
+{
+    motor_brake(LEFT_IN1, LEFT_IN2, LEDC_CHANNEL_0);
+    motor_brake(BACK_IN1, BACK_IN2, LEDC_CHANNEL_1);
+    motor_brake(RIGHT_IN1, RIGHT_IN2, LEDC_CHANNEL_2);
 }
 
 static void chassis_straight(bool forward)
@@ -358,7 +311,6 @@ static bool camera_frame_callback(const uvc_host_frame_t *frame, void *user_cont
     s_jpeg_size = frame->data_len;
     s_input_width = frame->vs_format.h_res;
     s_input_height = frame->vs_format.v_res;
-    ++s_camera_frame_count;
     xSemaphoreGive(s_frame_mutex);
     xSemaphoreGive(s_frame_ready); /* Counting semaphore depth is one: newest frame wins. */
     return true;
@@ -383,14 +335,15 @@ static void camera_process_task(void *argument)
     (void)argument;
     int64_t last_decode_us = 0;
     int64_t last_report_us = 0;
+    uint32_t processed_frames = 0;
     uint32_t last_report_frames = 0;
 
     while (true) {
         if (xSemaphoreTake(s_frame_ready, portMAX_DELAY) != pdTRUE) continue;
 
         const int64_t now_us = esp_timer_get_time();
-        if (now_us - last_decode_us < FRAME_DECODE_MIN_GAP_US) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+        if (now_us - last_decode_us < RED_PROCESS_PERIOD_US) {
+            vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
         last_decode_us = now_us;
@@ -440,20 +393,20 @@ static void camera_process_task(void *argument)
         }
 
         const size_t stride = output.output_len / output.height;
-        make_stream_color(s_decode_buffer, stride, output.width, output.height);
-        update_red_measurement();
-        if (s_stream_enabled) send_color_frame();
+        update_red_measurement(s_decode_buffer, stride, output.width, output.height);
+        ++processed_frames;
 
-        if (last_report_us == 0 || now_us - last_report_us >= 1000000) {
+        const int64_t report_us = esp_timer_get_time();
+        if (last_report_us == 0 || report_us - last_report_us >= 1000000) {
             const float fps = last_report_us == 0 ? 0.0f :
-                (float)(s_camera_frame_count - last_report_frames) * 1000000.0f /
-                (float)(now_us - last_report_us);
-            last_report_us = now_us;
-            last_report_frames = s_camera_frame_count;
-            ESP_LOGI(TAG, "image %ux%u -> RGB565 %dx%d, camera %.1f fps, stream=%s",
+                (float)(processed_frames - last_report_frames) * 1000000.0f /
+                (float)(report_us - last_report_us);
+            last_report_us = report_us;
+            last_report_frames = processed_frames;
+            ESP_LOGI(TAG, "image %ux%u -> red map %dx%d at %.1f fps, red=%u x=%d",
                      (unsigned)output.width, (unsigned)output.height,
-                     STREAM_WIDTH, STREAM_HEIGHT, (double)fps,
-                     s_stream_enabled ? "on" : "off");
+                     RED_MAP_WIDTH, RED_MAP_HEIGHT, (double)fps,
+                     s_red_pixels, s_red_center_x);
         }
 
         /* esp_jpeg_decode() is CPU-intensive. This real sleep (rather than
@@ -463,25 +416,26 @@ static void camera_process_task(void *argument)
     }
 }
 
-static bool profile_is_listed(const uvc_host_frame_info_t *format)
+static bool profile_is_listed(const uvc_host_frame_info_t *format, float fps)
 {
     for (int i = 0; i < s_profile_count; ++i) {
         if (s_profiles[i].format == format->format &&
             s_profiles[i].h_res == format->h_res &&
-            s_profiles[i].v_res == format->v_res) {
+            s_profiles[i].v_res == format->v_res &&
+            s_profiles[i].fps == fps) {
             return true;
         }
     }
     return false;
 }
 
-static void add_profile(const uvc_host_frame_info_t *format)
+static void add_profile(const uvc_host_frame_info_t *format, float fps)
 {
-    if (s_profile_count >= MAX_PROFILES || profile_is_listed(format)) return;
+    if (s_profile_count >= MAX_PROFILES || profile_is_listed(format, fps)) return;
     s_profiles[s_profile_count++] = (uvc_host_stream_format_t) {
         .h_res = format->h_res,
         .v_res = format->v_res,
-        .fps = 0,
+        .fps = fps,
         .format = format->format,
     };
 }
@@ -489,9 +443,9 @@ static void add_profile(const uvc_host_frame_info_t *format)
 static void build_mjpeg_profiles(const uvc_host_frame_info_t *formats, size_t count)
 {
     static const struct { uint16_t width; uint16_t height; } preferred[] = {
-        /* Red-ball detection only transmits an 80x60 image.  Starting with
-         * 720p makes JPEG decoding the bottleneck (about 0.7 FPS), so use
-         * the smallest common MJPEG mode first. */
+        /* Red-ball detection only samples 80x60 points. Starting with 720p
+         * makes JPEG decoding the bottleneck, so use the smallest common
+         * MJPEG mode first. */
         {320, 240}, {640, 480}, {800, 480}, {960, 540}, {1280, 720},
     };
     s_profile_count = 0;
@@ -503,12 +457,14 @@ static void build_mjpeg_profiles(const uvc_host_frame_info_t *formats, size_t co
                 formats[index].v_res != preferred[preference].height) {
                 continue;
             }
-            add_profile(&formats[index]);
+            add_profile(&formats[index], CAMERA_REQUEST_FPS);
+            add_profile(&formats[index], 0); /* Fallback if 10 FPS is unsupported. */
         }
     }
     for (size_t index = 0; index < count && s_profile_count < MAX_PROFILES; ++index) {
         if (formats[index].format != UVC_VS_FORMAT_MJPEG) continue;
-        add_profile(&formats[index]);
+        add_profile(&formats[index], CAMERA_REQUEST_FPS);
+        add_profile(&formats[index], 0);
     }
 }
 
@@ -535,8 +491,9 @@ static void uvc_stream_task(void *argument)
         config.advanced.number_of_urbs = UVC_URB_COUNT;
         config.advanced.urb_size = UVC_URB_SIZE;
 
-        ESP_LOGI(TAG, "trying %s %ux%u", format_name(config.vs_format.format),
-                 (unsigned)config.vs_format.h_res, (unsigned)config.vs_format.v_res);
+        ESP_LOGI(TAG, "trying %s %ux%u@%.1f", format_name(config.vs_format.format),
+                 (unsigned)config.vs_format.h_res, (unsigned)config.vs_format.v_res,
+                 (double)config.vs_format.fps);
         uvc_host_stream_hdl_t stream = NULL;
         esp_err_t error = uvc_host_stream_open(&config, pdMS_TO_TICKS(5000), &stream);
         if (error != ESP_OK) {
@@ -554,7 +511,7 @@ static void uvc_stream_task(void *argument)
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
-        ESP_LOGI(TAG, "STREAMING_STARTED (open the PC viewer to send v)");
+        ESP_LOGI(TAG, "STREAMING_STARTED: offline red detection active");
         while (s_device_connected) vTaskDelay(pdMS_TO_TICKS(1000));
         profile_index = 0;
     }
@@ -609,63 +566,6 @@ static void uvc_driver_event_callback(const uvc_host_driver_event_data_t *event,
     }
 }
 
-static void init_serial(void)
-{
-    const uart_config_t config = {
-        .baud_rate = STREAM_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    if (!uart_is_driver_installed(UART_NUM_0)) {
-        ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 32768, 0, NULL, 0));
-    }
-    uart_vfs_dev_use_driver(UART_NUM_0);
-    setvbuf(stdin, NULL, _IONBF, 0);
-    setvbuf(stdout, NULL, _IONBF, 0);
-}
-
-static void serial_command_task(void *argument)
-{
-    (void)argument;
-    printf("\n=== ESP32-S3 Camera Image Viewer ===\n");
-    printf("Camera: %s; D-=GPIO%d, D+=GPIO%d; serial=%d baud\n",
-           CAMERA_MODEL_NAME, USB_D_MINUS_GPIO, USB_D_PLUS_GPIO, STREAM_BAUD);
-    printf("Commands: v=start colour stream, x=stop, r<byte>=red threshold\n");
-    printf("Run tools/color_viewer.py on the Mac; it automatically sends v.\n\n");
-
-    while (true) {
-        const int character = getchar();
-        if (character == EOF || character == '\n' || character == '\r') continue;
-        switch ((char)character) {
-        case 'v': case 'V':
-            s_stream_enabled = true;
-            printf("colour stream ON\n");
-            break;
-        case 'x': case 'X':
-            s_stream_enabled = false;
-            printf("colour stream OFF\n");
-            break;
-        case 'r': case 'R': {
-            const int threshold = getchar();
-            if (threshold != EOF) {
-                s_redness_threshold = (uint8_t)threshold;
-                printf("red threshold=%u\n", s_redness_threshold);
-            }
-            break;
-        }
-        default:
-            printf("commands: v / x\n");
-            break;
-        }
-    }
-}
-
 typedef enum {
     RED_IDLE,
     RED_SEARCH,
@@ -703,36 +603,72 @@ static void red_ball_control_task(void *argument)
     int detect_confirmations = 0;
     int center_confirmations = 0;
     int lost_frames = 0;
+    int align_step_ms = ALIGN_INITIAL_STEP_MS;
+    int previous_error_side = 0;
+    bool search_should_step = false;
+    bool turn_step_active = false;
+    bool turn_brake_active = false;
+    int64_t turn_step_ends_ms = 0;
+    int64_t turn_brake_ends_ms = 0;
+    int64_t settle_until_ms = 0;
     int64_t state_started_ms = 0;
     while (true) {
         const int64_t now_ms = esp_timer_get_time() / 1000;
+
+        if (turn_step_active && now_ms >= turn_step_ends_ms) {
+            chassis_brake();
+            turn_step_active = false;
+            turn_brake_active = true;
+            turn_brake_ends_ms = now_ms + TURN_BRAKE_MS;
+        }
+        if (turn_brake_active && now_ms >= turn_brake_ends_ms) {
+            chassis_stop();
+            turn_brake_active = false;
+            settle_until_ms = now_ms + TURN_SETTLE_MS;
+        }
+
         if (boot_pressed()) {
             if (state == RED_IDLE || state == RED_COMPLETE) {
                 state = RED_SEARCH;
                 detect_confirmations = 0;
                 center_confirmations = 0;
                 lost_frames = 0;
-                chassis_rotate(-SEARCH_LEFT_POWER);
-                ESP_LOGI(TAG, "BOOT: searching red ball, rotating left at %d%%",
-                         SEARCH_LEFT_POWER);
+                align_step_ms = ALIGN_INITIAL_STEP_MS;
+                previous_error_side = 0;
+                search_should_step = true;
+                turn_step_active = false;
+                turn_brake_active = false;
+                settle_until_ms = now_ms;
+                chassis_stop();
+                ESP_LOGI(TAG, "BOOT: searching red ball with %d ms left steps",
+                         SEARCH_STEP_MS);
             } else {
                 state = RED_IDLE;
+                turn_step_active = false;
+                turn_brake_active = false;
+                search_should_step = false;
                 chassis_stop();
                 ESP_LOGI(TAG, "BOOT: stopped");
             }
         }
 
         if ((state == RED_SEARCH || state == RED_ALIGN) &&
+            !turn_step_active && !turn_brake_active &&
+            now_ms >= settle_until_ms &&
             s_red_sequence != seen_sequence) {
             seen_sequence = s_red_sequence;
             const bool red_detected = s_red_pixels >= RED_PIXELS_TO_TRIGGER;
 
             if (state == RED_SEARCH) {
                 detect_confirmations = red_detected ? detect_confirmations + 1 : 0;
+                search_should_step = !red_detected;
                 if (detect_confirmations >= RED_CONFIRM_FRAMES) {
                     state = RED_ALIGN;
                     center_confirmations = 0;
                     lost_frames = 0;
+                    align_step_ms = ALIGN_INITIAL_STEP_MS;
+                    previous_error_side = 0;
+                    search_should_step = false;
                     ESP_LOGI(TAG, "red detected: pixels=%u center_x=%d; aligning",
                              s_red_pixels, s_red_center_x);
                 }
@@ -745,12 +681,14 @@ static void red_ball_control_task(void *argument)
                     if (lost_frames >= ALIGN_LOST_FRAME_LIMIT) {
                         state = RED_SEARCH;
                         detect_confirmations = 0;
-                        chassis_rotate(-SEARCH_LEFT_POWER);
-                        ESP_LOGW(TAG, "red lost while aligning; resume left search");
+                        align_step_ms = ALIGN_INITIAL_STEP_MS;
+                        previous_error_side = 0;
+                        search_should_step = true;
+                        ESP_LOGW(TAG, "red lost while aligning; resume stepped search");
                     }
                 } else {
                     lost_frames = 0;
-                    const int error = s_red_center_x - STREAM_WIDTH / 2;
+                    const int error = s_red_center_x - RED_MAP_WIDTH / 2;
                     const int distance = abs(error);
                     if (distance <= CENTER_DEADBAND_PX) {
                         chassis_stop();
@@ -758,25 +696,43 @@ static void red_ball_control_task(void *argument)
                         if (center_confirmations >= CENTER_CONFIRM_FRAMES) {
                             state = RED_PUSH;
                             state_started_ms = now_ms;
+                            previous_error_side = 0;
                             ESP_LOGI(TAG,
                                      "red centered: x=%d pixels=%u; push forward",
                                      s_red_center_x, s_red_pixels);
                         }
                     } else {
                         center_confirmations = 0;
-                        const int power = distance <= CENTER_FINE_ZONE_PX ?
-                                          ALIGN_FINE_POWER : ALIGN_COARSE_POWER;
-                        /* Target left of centre -> rotate left.  If it crosses
-                         * the centre, error changes sign and the chassis
-                         * automatically rotates back to correct overshoot. */
-                        chassis_rotate(error < 0 ? -power : power);
+                        const int error_side = error < 0 ? -1 : 1;
+                        if (previous_error_side != 0 &&
+                            error_side != previous_error_side) {
+                            align_step_ms /= 2;
+                            if (align_step_ms < ALIGN_MIN_STEP_MS) {
+                                align_step_ms = ALIGN_MIN_STEP_MS;
+                            }
+                            ESP_LOGI(TAG,
+                                     "center crossed; reverse with half step=%d ms",
+                                     align_step_ms);
+                        }
+                        previous_error_side = error_side;
+                        chassis_rotate(error_side * TURN_STEP_POWER);
+                        turn_step_active = true;
+                        turn_step_ends_ms = now_ms + align_step_ms;
+                        ESP_LOGI(TAG, "align step: error=%d direction=%s duration=%d ms",
+                                 error, error_side < 0 ? "left" : "right",
+                                 align_step_ms);
                     }
                 }
             }
         }
 
-        if (state == RED_SEARCH) {
-            chassis_rotate(-SEARCH_LEFT_POWER);
+        if (state == RED_SEARCH && search_should_step &&
+            !turn_step_active && !turn_brake_active &&
+            now_ms >= settle_until_ms) {
+            chassis_rotate(-TURN_STEP_POWER);
+            turn_step_active = true;
+            turn_step_ends_ms = now_ms + SEARCH_STEP_MS;
+            search_should_step = false;
         } else if (state == RED_PUSH) {
             chassis_straight(true);
             if (now_ms - state_started_ms >= PUSH_FORWARD_MS) {
@@ -823,8 +779,6 @@ void app_main(void)
         ESP_LOGE(TAG, "initialization failed");
         return;
     }
-    init_serial();
-    assert(xTaskCreate(serial_command_task, "serial_command", 4096, NULL, 3, NULL) == pdPASS);
     assert(xTaskCreate(camera_process_task, "camera_process", 8192, NULL, 6, NULL) == pdPASS);
 
     const usb_host_config_t host_config = {
@@ -845,6 +799,8 @@ void app_main(void)
     ESP_ERROR_CHECK(uvc_host_install(&uvc_config));
     configure_motor_hardware();
     assert(xTaskCreate(red_ball_control_task, "red_ball_control", 4096, NULL, 5, NULL) == pdPASS);
-    ESP_LOGI(TAG, "waiting for UVC camera; run PC viewer after STREAMING_STARTED");
+    ESP_LOGI(TAG, "camera=%s D-=GPIO%d D+=GPIO%d; offline 10 FPS red detection",
+             CAMERA_MODEL_NAME, USB_D_MINUS_GPIO, USB_D_PLUS_GPIO);
+    ESP_LOGI(TAG, "waiting for UVC camera; no computer viewer is required");
     ESP_LOGI(TAG, "red control ready: press BOOT to start");
 }
