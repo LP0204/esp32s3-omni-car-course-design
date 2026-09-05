@@ -15,6 +15,7 @@
 | `ultrasonic-avoidance` | HC-SR04 超声波测距与避障程序 |
 | `camera-gray-viewer` | 720p UVC 取图、80×60 灰度串流及 macOS 浏览器实时预览 |
 | `camera-sensor-display` | 摄像头四路虚拟传感器、TFT18 状态与距离显示测试 |
+| `green-ball-push` | 摄像头绿度识别，绿色目标前进—停顿—后退，并提供 640×480 电脑预览 |
 
 除 TFT18 独立测试工程外，其他需要显示传感器状态的工程均内置同一套
 `LQ_TFT18SPIV33` 显示模块；显示屏断开时不影响电机和传感器控制逻辑。
