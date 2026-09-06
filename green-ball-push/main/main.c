@@ -2,32 +2,27 @@
  * ESP32-S3 green-ball push controller
  *
  * The UVC camera pipeline is derived from the verified camera-color-viewer
- * project. Green detection and motor control run on the ESP32-S3. While the
- * PC viewer is enabled, the original 640x480 MJPEG frame is sent as JPEG so
- * the browser can show a real 480p preview without sending raw RGB565 data.
+ * project. Green detection and motor control run entirely on the ESP32-S3;
+ * no image data is sent to a computer, so USB/UART bandwidth and CPU time
+ * are reserved for camera capture and on-device processing.
  *
  * Data path (adapted for the JQ-CAM12-720D-V1 reference project):
  * UVC MJPEG camera -> usb_host_uvc v2 -> esp_jpeg -> 80x60 green sampling
- * -> green area -> motor state machine, plus MJPEG -> UART -> PC viewer.
+ * -> green area -> motor state machine.
  */
 
 #include <assert.h>
-#include <stdarg.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
-#include "driver/uart.h"
-#include "driver/uart_vfs.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_intr_alloc.h"
 #include "esp_log.h"
-#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -43,8 +38,8 @@ static const char *TAG = "GREEN_BALL";
 #define USB_D_PLUS_GPIO 20
 #define CAMERA_MODEL_NAME "JQ-CAM12-720D-V1"
 
-/* A 640x480 MJPEG frame is normally below 100 KB.  The frame and decode
- * buffers must be in PSRAM, not internal RAM. */
+/* MJPEG frames and the decoded working buffer must be in PSRAM, not
+ * internal RAM. */
 #define MAX_JPEG_BYTES (512U * 1024U)
 #define DECODE_MAX_W 160
 #define DECODE_MAX_H 120
@@ -54,17 +49,9 @@ static const char *TAG = "GREEN_BALL";
 /* Green detection samples 80x60 points directly from the decoded frame. */
 #define GREEN_MAP_WIDTH 80
 #define GREEN_MAP_HEIGHT 60
-#define GREEN_MAP_PIXELS (GREEN_MAP_WIDTH * GREEN_MAP_HEIGHT)
 #define GREEN_PROCESS_PERIOD_US (100U * 1000U) /* 10 FPS target. */
 #define DECODE_TASK_YIELD_MS 2
 #define CAMERA_REQUEST_FPS 15.0f
-
-/* The PC preview carries the original MJPEG frame. A 640x480 profile is
- * selected first; the browser decodes this packet to a true 480p image. */
-#define STREAM_BAUD 921600
-#define PREVIEW_MIN_GAP_US (200U * 1000U)
-#define JPEG_PACKET_HEADER_BYTES 12U
-#define GREEN_MAP_PACKET_HEADER_BYTES 8U
 
 /* This matches the normal physical camera mounting on the car. Set to 0 if
  * you deliberately want the unrotated raw orientation. */
@@ -76,14 +63,23 @@ static const char *TAG = "GREEN_BALL";
 #define MAX_PROFILES 8
 
 /* Green-ball control: deliberately only one colour metric. */
-#define GREENNESS_THRESHOLD_DEFAULT 42
-#define GREENNESS_THRESHOLD_MIN 0
-#define GREENNESS_THRESHOLD_MAX 160
+#define GREENNESS_THRESHOLD 30
 #define GREEN_MIN_CHANNEL 75
-#define GREEN_PIXELS_TO_TRIGGER 20
+#define GREEN_PIXELS_TO_TRIGGER 3
 #define GREEN_CONFIRM_FRAMES 3
-#define LEFT_STRAIGHT_POWER_PERCENT 51
-#define RIGHT_STRAIGHT_POWER_PERCENT 65
+#define CENTER_CONFIRM_FRAMES 3
+#define CENTER_DEADBAND_PX 5
+#define ALIGN_LOST_FRAME_LIMIT 3
+#define TURN_STEP_POWER 70
+#define SEARCH_STEP_MS 40
+#define ALIGN_INITIAL_STEP_MS 50
+#define ALIGN_MIN_STEP_MS 20
+#define OVERSHOOT_REVERSE_NUMERATOR 2
+#define OVERSHOOT_REVERSE_DENOMINATOR 3
+#define TURN_BRAKE_MS 90
+#define TURN_SETTLE_MS 200
+#define LEFT_STRAIGHT_POWER_PERCENT 58
+#define RIGHT_STRAIGHT_POWER_PERCENT 62
 #define PUSH_FORWARD_MS 900
 #define PUSH_PAUSE_MS 500
 #define PUSH_RETURN_MS 930
@@ -106,33 +102,21 @@ static const char *TAG = "GREEN_BALL";
 #define RIGHT_FORWARD_SIGN (-1)
 
 static SemaphoreHandle_t s_frame_ready;
-static SemaphoreHandle_t s_uart_tx_mutex;
 static SemaphoreHandle_t s_frame_mutex;
-static SemaphoreHandle_t s_preview_mutex;
-static SemaphoreHandle_t s_green_map_mutex;
 static uint8_t *s_jpeg_buffer;
 static uint8_t *s_decode_buffer;
-static uint8_t *s_preview_buffers[2];
 static uint8_t s_jpeg_work[JPEG_WORK_BYTES];
 static volatile size_t s_jpeg_size;
 static volatile uint32_t s_input_width;
 static volatile uint32_t s_input_height;
 
 static volatile uint16_t s_green_pixels;
+static volatile uint16_t s_green_bright_pixels;
+static volatile uint16_t s_green_metric_pixels;
 static volatile int16_t s_green_center_x = GREEN_MAP_WIDTH / 2;
+static volatile int16_t s_max_greenness;
+static volatile uint8_t s_max_green_channel;
 static volatile uint32_t s_green_sequence;
-static uint8_t s_green_map[GREEN_MAP_PIXELS];
-static uint8_t s_green_map_tx[GREEN_MAP_PIXELS];
-static volatile int s_greenness_threshold = GREENNESS_THRESHOLD_DEFAULT;
-static volatile bool s_stream_enabled;
-static volatile bool s_preview_pending;
-static uint8_t s_preview_ready_index;
-static uint8_t s_preview_write_index;
-static uint8_t s_preview_sending_index = 0xffU;
-static size_t s_preview_size;
-static uint16_t s_preview_width;
-static uint16_t s_preview_height;
-static int64_t s_last_preview_copy_us;
 
 static uint8_t s_device_addr;
 static uint8_t s_stream_index;
@@ -153,81 +137,15 @@ static const char *format_name(enum uvc_host_stream_format format)
     }
 }
 
-static uint16_t crc16_xmodem(const uint8_t *data, size_t length)
-{
-    uint16_t crc = 0;
-    for (size_t i = 0; i < length; ++i) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int bit = 0; bit < 8; ++bit) {
-            crc = (crc & 0x8000U) ? (uint16_t)((crc << 1) ^ 0x1021U)
-                                   : (uint16_t)(crc << 1);
-        }
-    }
-    return crc;
-}
-
-static int serial_log_write(const char *format, va_list args)
-{
-    xSemaphoreTake(s_uart_tx_mutex, portMAX_DELAY);
-    const int result = vprintf(format, args);
-    xSemaphoreGive(s_uart_tx_mutex);
-    return result;
-}
-
-static void send_jpeg_frame(const uint8_t *jpeg, size_t jpeg_size,
-                            uint16_t width, uint16_t height)
-{
-    uint8_t header[JPEG_PACKET_HEADER_BYTES];
-    header[0] = 'J';
-    header[1] = 'P';
-    header[2] = 'G';
-    header[3] = '4';
-    header[4] = width & 0xffU;
-    header[5] = width >> 8;
-    header[6] = height & 0xffU;
-    header[7] = height >> 8;
-    header[8] = jpeg_size & 0xffU;
-    header[9] = (jpeg_size >> 8) & 0xffU;
-    header[10] = (jpeg_size >> 16) & 0xffU;
-    header[11] = (jpeg_size >> 24) & 0xffU;
-    const uint16_t crc = crc16_xmodem(jpeg, jpeg_size);
-    uart_write_bytes(UART_NUM_0, header, sizeof(header));
-    uart_write_bytes(UART_NUM_0, jpeg, jpeg_size);
-    uint8_t trailer[2] = { crc & 0xffU, crc >> 8 };
-    uart_write_bytes(UART_NUM_0, trailer, sizeof(trailer));
-}
-
-static void send_green_map(void)
-{
-    if (xSemaphoreTake(s_green_map_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
-        return;
-    }
-    memcpy(s_green_map_tx, s_green_map, sizeof(s_green_map_tx));
-    xSemaphoreGive(s_green_map_mutex);
-
-    uint8_t header[GREEN_MAP_PACKET_HEADER_BYTES];
-    header[0] = 'G';
-    header[1] = 'M';
-    header[2] = 'A';
-    header[3] = 'P';
-    header[4] = GREEN_MAP_WIDTH;
-    header[5] = 0;
-    header[6] = GREEN_MAP_HEIGHT;
-    header[7] = 0;
-    const uint16_t crc = crc16_xmodem(s_green_map_tx, sizeof(s_green_map_tx));
-    uart_write_bytes(UART_NUM_0, header, sizeof(header));
-    uart_write_bytes(UART_NUM_0, s_green_map_tx, sizeof(s_green_map_tx));
-    uint8_t trailer[2] = { crc & 0xffU, crc >> 8 };
-    uart_write_bytes(UART_NUM_0, trailer, sizeof(trailer));
-}
-
 static void update_green_measurement(const uint8_t *rgb565, size_t stride,
                                      uint32_t width, uint32_t height)
 {
-    xSemaphoreTake(s_green_map_mutex, portMAX_DELAY);
-    const int greenness_threshold = s_greenness_threshold;
     uint16_t count = 0;
+    uint16_t bright_count = 0;
+    uint16_t metric_count = 0;
     uint32_t x_sum = 0;
+    int max_greenness = -255;
+    int max_green_channel = 0;
     for (int y = 0; y < GREEN_MAP_HEIGHT; ++y) {
         const uint32_t source_y = (uint32_t)y * height / GREEN_MAP_HEIGHT;
         const uint8_t *row = rgb565 + (size_t)source_y * stride;
@@ -239,11 +157,12 @@ static void update_green_measurement(const uint8_t *rgb565, size_t stride,
             const int green = ((value >> 5) & 0x3fU) * 255 / 63;
             const int blue = (value & 0x1fU) * 255 / 31;
             const int greenness = green - (red + blue) / 2;
+            if (green > max_green_channel) max_green_channel = green;
+            if (greenness > max_greenness) max_greenness = greenness;
+            if (green > GREEN_MIN_CHANNEL) ++bright_count;
+            if (greenness > GREENNESS_THRESHOLD) ++metric_count;
             const bool is_green = green > GREEN_MIN_CHANNEL &&
-                                  greenness > greenness_threshold;
-            /* Store the raw camera orientation; the PC viewer rotates both
-             * panes together so the mask remains registered with the image. */
-            s_green_map[(size_t)y * GREEN_MAP_WIDTH + x] = is_green ? 1U : 0U;
+                                  greenness > GREENNESS_THRESHOLD;
             const int logical_x = CAMERA_ROTATE_180 ?
                                   GREEN_MAP_WIDTH - 1 - x : x;
             if (is_green) {
@@ -253,9 +172,12 @@ static void update_green_measurement(const uint8_t *rgb565, size_t stride,
         }
     }
     s_green_pixels = count;
+    s_green_bright_pixels = bright_count;
+    s_green_metric_pixels = metric_count;
+    s_max_greenness = (int16_t)max_greenness;
+    s_max_green_channel = (uint8_t)max_green_channel;
     if (count > 0) s_green_center_x = (int16_t)(x_sum / count);
     ++s_green_sequence;
-    xSemaphoreGive(s_green_map_mutex);
 }
 
 static uint32_t duty_from_percent(int percent)
@@ -289,6 +211,25 @@ static void chassis_stop(void)
     motor_write(RIGHT_IN1, RIGHT_IN2, LEDC_CHANNEL_2, RIGHT_ELECTRICAL_SIGN, 0);
 }
 
+static void motor_brake(gpio_num_t in1, gpio_num_t in2, ledc_channel_t channel)
+{
+    ESP_ERROR_CHECK(gpio_set_level(in1, 1));
+    ESP_ERROR_CHECK(gpio_set_level(in2, 1));
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, channel,
+                                  (1U << LEDC_TIMER_10_BIT) - 1U));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, channel));
+}
+
+/* Full-duty active braking on all three wheels. Keep this active for a
+ * short interval before releasing the H-bridges, so chassis inertia does not
+ * carry the camera past the target. */
+static void chassis_brake(void)
+{
+    motor_brake(LEFT_IN1, LEFT_IN2, LEDC_CHANNEL_0);
+    motor_brake(BACK_IN1, BACK_IN2, LEDC_CHANNEL_1);
+    motor_brake(RIGHT_IN1, RIGHT_IN2, LEDC_CHANNEL_2);
+}
+
 static void chassis_straight(bool forward)
 {
     const int sign = forward ? 1 : -1;
@@ -297,6 +238,17 @@ static void chassis_straight(bool forward)
                 sign * LEFT_FORWARD_SIGN * LEFT_STRAIGHT_POWER_PERCENT);
     motor_write(RIGHT_IN1, RIGHT_IN2, LEDC_CHANNEL_2, RIGHT_ELECTRICAL_SIGN,
                 sign * RIGHT_FORWARD_SIGN * RIGHT_STRAIGHT_POWER_PERCENT);
+}
+
+/* Positive command is the project's clockwise/right rotation direction. */
+static void chassis_rotate(int clockwise_percent)
+{
+    motor_write(LEFT_IN1, LEFT_IN2, LEDC_CHANNEL_0, LEFT_ELECTRICAL_SIGN,
+                clockwise_percent);
+    motor_write(BACK_IN1, BACK_IN2, LEDC_CHANNEL_1, -1,
+                clockwise_percent);
+    motor_write(RIGHT_IN1, RIGHT_IN2, LEDC_CHANNEL_2, RIGHT_ELECTRICAL_SIGN,
+                clockwise_percent);
 }
 
 static void configure_motor_hardware(void)
@@ -380,29 +332,6 @@ static bool camera_frame_callback(const uvc_host_frame_t *frame, void *user_cont
     s_input_width = frame->vs_format.h_res;
     s_input_height = frame->vs_format.v_res;
     xSemaphoreGive(s_frame_mutex);
-
-    /* Keep a separate copy for the PC viewer. If the UART sender is busy,
-     * skip this preview frame; the decoder and green detector stay live. */
-    const int64_t now_us = esp_timer_get_time();
-    if (s_stream_enabled && now_us - s_last_preview_copy_us >= PREVIEW_MIN_GAP_US &&
-        xSemaphoreTake(s_preview_mutex, 0) == pdTRUE) {
-        /* The sender owns s_preview_sending_index. Never overwrite that
-         * buffer while a potentially large JPEG is leaving the UART. If both
-         * buffers are occupied, drop this preview frame; camera processing
-         * and green detection continue independently. */
-        const uint8_t write_index = s_preview_write_index;
-        if (write_index != s_preview_sending_index) {
-            memcpy(s_preview_buffers[write_index], frame->data, frame->data_len);
-            s_preview_size = frame->data_len;
-            s_preview_width = frame->vs_format.h_res;
-            s_preview_height = frame->vs_format.v_res;
-            s_preview_ready_index = write_index;
-            s_preview_write_index ^= 1U;
-            s_preview_pending = true;
-            s_last_preview_copy_us = now_us;
-        }
-        xSemaphoreGive(s_preview_mutex);
-    }
     xSemaphoreGive(s_frame_ready); /* Counting semaphore depth is one: newest frame wins. */
     return true;
 }
@@ -488,71 +417,25 @@ static void camera_process_task(void *argument)
         ++processed_frames;
 
         const int64_t report_us = esp_timer_get_time();
-        /* Console text shares UART0 with the binary preview. Suppress the
-         * periodic diagnostic line while streaming so it cannot land inside
-         * a JPG4/GMAP packet and make the viewer discard a frame. The browser
-         * already reports the received preview FPS. */
-        if (!s_stream_enabled &&
-            (last_report_us == 0 || report_us - last_report_us >= 1000000)) {
+        if (last_report_us == 0 || report_us - last_report_us >= 1000000) {
             const float fps = last_report_us == 0 ? 0.0f :
                 (float)(processed_frames - last_report_frames) * 1000000.0f /
                 (float)(report_us - last_report_us);
             last_report_us = report_us;
             last_report_frames = processed_frames;
-            ESP_LOGI(TAG, "image %ux%u -> green map %dx%d at %.1f fps, green=%u x=%d threshold=%d preview=%s",
+            ESP_LOGI(TAG, "image %ux%u -> green sampling %dx%d at %.1f fps, green=%u bright=%u metric=%u maxG=%d peak=%u x=%d threshold=%d need=%d",
                      (unsigned)output.width, (unsigned)output.height,
                      GREEN_MAP_WIDTH, GREEN_MAP_HEIGHT, (double)fps,
-                     s_green_pixels, s_green_center_x, s_greenness_threshold,
-                     s_stream_enabled ? "on" : "off");
+                     s_green_pixels, s_green_bright_pixels,
+                     s_green_metric_pixels, s_max_greenness,
+                     s_max_green_channel, s_green_center_x,
+                     GREENNESS_THRESHOLD, GREEN_PIXELS_TO_TRIGGER);
         }
 
         /* esp_jpeg_decode() is CPU-intensive. This real sleep (rather than
          * taskYIELD) guarantees that the Idle task runs and prevents the
-         * Task Watchdog warning observed during continuous preview. */
+         * Task Watchdog warning observed during continuous decoding. */
         vTaskDelay(pdMS_TO_TICKS(DECODE_TASK_YIELD_MS));
-    }
-}
-
-static void preview_stream_task(void *argument)
-{
-    (void)argument;
-    while (true) {
-        if (!s_stream_enabled) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
-        uint8_t *send_buffer = NULL;
-        size_t send_size = 0;
-        uint16_t send_width = 0;
-        uint16_t send_height = 0;
-        uint8_t send_index = 0xffU;
-        if (xSemaphoreTake(s_preview_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-            if (s_preview_pending && s_preview_sending_index == 0xffU) {
-                send_index = s_preview_ready_index;
-                send_buffer = s_preview_buffers[send_index];
-                send_size = s_preview_size;
-                send_width = s_preview_width;
-                send_height = s_preview_height;
-                s_preview_pending = false;
-                s_preview_sending_index = send_index;
-            }
-            xSemaphoreGive(s_preview_mutex);
-        }
-        if (send_buffer != NULL) {
-            /* Do not hold the preview mutex during UART transmission. The
-             * other buffer can receive a newer frame meanwhile. */
-            xSemaphoreTake(s_uart_tx_mutex, portMAX_DELAY);
-            send_jpeg_frame(send_buffer, send_size, send_width, send_height);
-            /* Send the exact 80x60 mask used by the motor state machine. */
-            send_green_map();
-            xSemaphoreGive(s_uart_tx_mutex);
-            if (xSemaphoreTake(s_preview_mutex, portMAX_DELAY) == pdTRUE) {
-                s_preview_sending_index = 0xffU;
-                xSemaphoreGive(s_preview_mutex);
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
@@ -583,9 +466,9 @@ static void add_profile(const uvc_host_frame_info_t *format, float fps)
 static void build_mjpeg_profiles(const uvc_host_frame_info_t *formats, size_t count)
 {
     static const struct { uint16_t width; uint16_t height; } preferred[] = {
-        /* Prefer the requested 480p preview. Smaller/larger modes are
-         * fallbacks for camera variants that do not expose 640x480. */
-        {640, 480}, {320, 240}, {800, 480}, {960, 540}, {1280, 720},
+        /* Prefer the smallest useful MJPEG mode to leave CPU and USB
+         * bandwidth for continuous on-device green detection. */
+        {320, 240}, {480, 320}, {640, 480}, {800, 480}, {960, 540}, {1280, 720},
     };
     s_profile_count = 0;
 
@@ -650,7 +533,7 @@ static void uvc_stream_task(void *argument)
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
-        ESP_LOGI(TAG, "STREAMING_STARTED: green detection and optional 480p preview active");
+        ESP_LOGI(TAG, "STREAMING_STARTED: offline green detection active");
         while (s_device_connected) vTaskDelay(pdMS_TO_TICKS(1000));
         profile_index = 0;
     }
@@ -707,7 +590,8 @@ static void uvc_driver_event_callback(const uvc_host_driver_event_data_t *event,
 
 typedef enum {
     GREEN_IDLE,
-    GREEN_WAIT,
+    GREEN_SEARCH,
+    GREEN_ALIGN,
     GREEN_PUSH,
     GREEN_PAUSE,
     GREEN_RETURN,
@@ -733,43 +617,166 @@ static bool boot_pressed(void)
     return false;
 }
 
+static const char *green_state_name(green_state_t state)
+{
+    switch (state) {
+    case GREEN_IDLE: return "IDLE";
+    case GREEN_SEARCH: return "SEARCH_RIGHT";
+    case GREEN_ALIGN: return "ALIGN_GREEN";
+    case GREEN_PUSH: return "PUSH_FORWARD";
+    case GREEN_PAUSE: return "PAUSE";
+    case GREEN_RETURN: return "RETURN_BACKWARD";
+    case GREEN_COMPLETE: return "COMPLETE";
+    default: return "UNKNOWN";
+    }
+}
+
 static void green_ball_control_task(void *argument)
 {
     (void)argument;
     green_state_t state = GREEN_IDLE;
     uint32_t seen_sequence = 0;
     int detect_confirmations = 0;
+    int center_confirmations = 0;
+    int lost_frames = 0;
+    int align_step_ms = ALIGN_INITIAL_STEP_MS;
+    int previous_error_side = 0;
+    bool search_should_step = false;
+    bool turn_step_active = false;
+    bool turn_brake_active = false;
+    int64_t turn_step_ends_ms = 0;
+    int64_t turn_brake_ends_ms = 0;
+    int64_t settle_until_ms = 0;
     int64_t state_started_ms = 0;
+    int64_t last_status_ms = 0;
     while (true) {
         const int64_t now_ms = esp_timer_get_time() / 1000;
 
+        if (turn_step_active && now_ms >= turn_step_ends_ms) {
+            chassis_brake();
+            turn_step_active = false;
+            turn_brake_active = true;
+            turn_brake_ends_ms = now_ms + TURN_BRAKE_MS;
+            ESP_LOGI(TAG, "hard brake: %d ms", TURN_BRAKE_MS);
+        }
+        if (turn_brake_active && now_ms >= turn_brake_ends_ms) {
+            chassis_stop();
+            turn_brake_active = false;
+            settle_until_ms = now_ms + TURN_SETTLE_MS;
+        }
+
         if (boot_pressed()) {
             if (state == GREEN_IDLE || state == GREEN_COMPLETE) {
-                state = GREEN_WAIT;
+                state = GREEN_SEARCH;
                 detect_confirmations = 0;
+                center_confirmations = 0;
+                lost_frames = 0;
+                align_step_ms = ALIGN_INITIAL_STEP_MS;
+                previous_error_side = 0;
+                search_should_step = true;
+                turn_step_active = false;
+                turn_brake_active = false;
+                settle_until_ms = now_ms;
                 chassis_stop();
-                ESP_LOGI(TAG, "BOOT: waiting for green target");
+                ESP_LOGI(TAG, "BOOT: searching green; rotate right in %d ms steps",
+                         SEARCH_STEP_MS);
             } else {
                 state = GREEN_IDLE;
                 detect_confirmations = 0;
+                center_confirmations = 0;
+                search_should_step = false;
+                turn_step_active = false;
+                turn_brake_active = false;
                 chassis_stop();
                 ESP_LOGI(TAG, "BOOT: stopped");
             }
         }
 
-        if (state == GREEN_WAIT && s_green_sequence != seen_sequence) {
+        if ((state == GREEN_SEARCH || state == GREEN_ALIGN) &&
+            !turn_step_active && !turn_brake_active &&
+            now_ms >= settle_until_ms &&
+            s_green_sequence != seen_sequence) {
             seen_sequence = s_green_sequence;
             const bool green_detected = s_green_pixels >= GREEN_PIXELS_TO_TRIGGER;
-            detect_confirmations = green_detected ? detect_confirmations + 1 : 0;
-            if (detect_confirmations >= GREEN_CONFIRM_FRAMES) {
-                state = GREEN_PUSH;
-                state_started_ms = now_ms;
-                ESP_LOGI(TAG, "green detected: pixels=%u center_x=%d; push forward",
-                         s_green_pixels, s_green_center_x);
+
+            if (state == GREEN_SEARCH) {
+                detect_confirmations = green_detected ? detect_confirmations + 1 : 0;
+                search_should_step = !green_detected;
+                if (detect_confirmations >= GREEN_CONFIRM_FRAMES) {
+                    state = GREEN_ALIGN;
+                    center_confirmations = 0;
+                    lost_frames = 0;
+                    align_step_ms = ALIGN_INITIAL_STEP_MS;
+                    previous_error_side = 0;
+                    search_should_step = false;
+                    ESP_LOGI(TAG, "green detected: pixels=%u center_x=%d; aligning",
+                             s_green_pixels, s_green_center_x);
+                }
+            }
+
+            if (state == GREEN_ALIGN) {
+                if (!green_detected) {
+                    ++lost_frames;
+                    center_confirmations = 0;
+                    if (lost_frames >= ALIGN_LOST_FRAME_LIMIT) {
+                        state = GREEN_SEARCH;
+                        detect_confirmations = 0;
+                        align_step_ms = ALIGN_INITIAL_STEP_MS;
+                        previous_error_side = 0;
+                        search_should_step = true;
+                        ESP_LOGW(TAG, "green lost while aligning; resume right search");
+                    }
+                } else {
+                    lost_frames = 0;
+                    const int error = s_green_center_x - GREEN_MAP_WIDTH / 2;
+                    const int distance = abs(error);
+                    if (distance <= CENTER_DEADBAND_PX) {
+                        chassis_stop();
+                        ++center_confirmations;
+                        if (center_confirmations >= CENTER_CONFIRM_FRAMES) {
+                            state = GREEN_PUSH;
+                            state_started_ms = now_ms;
+                            previous_error_side = 0;
+                            ESP_LOGI(TAG,
+                                     "green centered: x=%d pixels=%u; push forward",
+                                     s_green_center_x, s_green_pixels);
+                        }
+                    } else {
+                        center_confirmations = 0;
+                        const int error_side = error < 0 ? -1 : 1;
+                        if (previous_error_side != 0 &&
+                            error_side != previous_error_side) {
+                            align_step_ms = (align_step_ms *
+                                             OVERSHOOT_REVERSE_NUMERATOR) /
+                                            OVERSHOOT_REVERSE_DENOMINATOR;
+                            if (align_step_ms < ALIGN_MIN_STEP_MS) {
+                                align_step_ms = ALIGN_MIN_STEP_MS;
+                            }
+                            ESP_LOGI(TAG,
+                                     "center crossed; reverse with 2/3 step=%d ms",
+                                     align_step_ms);
+                        }
+                        previous_error_side = error_side;
+                        chassis_rotate(error_side * TURN_STEP_POWER);
+                        turn_step_active = true;
+                        turn_step_ends_ms = now_ms + align_step_ms;
+                        ESP_LOGI(TAG, "align step: error=%d direction=%s duration=%d ms",
+                                 error, error_side < 0 ? "left" : "right",
+                                 align_step_ms);
+                    }
+                }
             }
         }
 
-        if (state == GREEN_PUSH) {
+        if (state == GREEN_SEARCH && search_should_step &&
+            !turn_step_active && !turn_brake_active &&
+            now_ms >= settle_until_ms) {
+            chassis_rotate(TURN_STEP_POWER);
+            turn_step_active = true;
+            turn_step_ends_ms = now_ms + SEARCH_STEP_MS;
+            search_should_step = false;
+            ESP_LOGI(TAG, "search step: direction=right duration=%d ms", SEARCH_STEP_MS);
+        } else if (state == GREEN_PUSH) {
             chassis_straight(true);
             if (now_ms - state_started_ms >= PUSH_FORWARD_MS) {
                 chassis_stop();
@@ -792,74 +799,17 @@ static void green_ball_control_task(void *argument)
                 ESP_LOGI(TAG, "return complete");
             }
         }
+        if (last_status_ms == 0 || now_ms - last_status_ms >= 1000) {
+            last_status_ms = now_ms;
+            ESP_LOGI(TAG, "status=%s green=%u bright=%u metric=%u maxG=%d peak=%u confirm=%d/%d threshold=%d need=%d seq=%u",
+                     green_state_name(state), s_green_pixels,
+                     s_green_bright_pixels, s_green_metric_pixels,
+                     s_max_greenness, s_max_green_channel,
+                     detect_confirmations, GREEN_CONFIRM_FRAMES,
+                     GREENNESS_THRESHOLD, GREEN_PIXELS_TO_TRIGGER,
+                     (unsigned)s_green_sequence);
+        }
         vTaskDelay(pdMS_TO_TICKS(20));
-    }
-}
-
-static void init_serial(void)
-{
-    const uart_config_t config = {
-        .baud_rate = STREAM_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    if (!uart_is_driver_installed(UART_NUM_0)) {
-        ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 32768, 0, NULL, 0));
-    }
-    uart_vfs_dev_use_driver(UART_NUM_0);
-    setvbuf(stdin, NULL, _IONBF, 0);
-    setvbuf(stdout, NULL, _IONBF, 0);
-}
-
-static void serial_command_task(void *argument)
-{
-    (void)argument;
-    printf("\n=== ESP32-S3 Green Ball Push ===\n");
-    printf("Camera: %s; D-=GPIO%d, D+=GPIO%d; serial=%d baud\n",
-           CAMERA_MODEL_NAME, USB_D_MINUS_GPIO, USB_D_PLUS_GPIO, STREAM_BAUD);
-    printf("Commands: v=start 640x480 JPEG preview, x=stop preview, gNNN=set green threshold\n");
-    printf("Press BOOT to run: green detected -> forward -> pause -> backward.\n\n");
-
-    while (true) {
-        const int character = getchar();
-        if (character == EOF || character == '\n' || character == '\r') continue;
-        switch ((char)character) {
-        case 'v': case 'V':
-            s_stream_enabled = true;
-            break;
-        case 'x': case 'X':
-            s_stream_enabled = false;
-            printf("JPEG preview OFF\n");
-            break;
-        case 'g': case 'G': {
-            char digits[5] = {0};
-            size_t length = 0;
-            while (length < sizeof(digits) - 1U) {
-                const int next = getchar();
-                if (next == '\n' || next == '\r' || next == EOF) break;
-                if (next >= '0' && next <= '9') digits[length++] = (char)next;
-            }
-            if (length == 0) {
-                printf("green threshold unchanged: %d\n", s_greenness_threshold);
-                break;
-            }
-            int value = atoi(digits);
-            if (value < GREENNESS_THRESHOLD_MIN) value = GREENNESS_THRESHOLD_MIN;
-            if (value > GREENNESS_THRESHOLD_MAX) value = GREENNESS_THRESHOLD_MAX;
-            s_greenness_threshold = value;
-            if (!s_stream_enabled) printf("GREEN_THRESHOLD=%d\n", value);
-            break;
-        }
-        default:
-            printf("commands: v / x / gNNN\n");
-            break;
-        }
     }
 }
 
@@ -867,10 +817,7 @@ static bool allocate_buffers(void)
 {
     s_jpeg_buffer = heap_caps_malloc(MAX_JPEG_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_decode_buffer = heap_caps_malloc(DECODE_BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_preview_buffers[0] = heap_caps_malloc(MAX_JPEG_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_preview_buffers[1] = heap_caps_malloc(MAX_JPEG_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_jpeg_buffer == NULL || s_decode_buffer == NULL ||
-        s_preview_buffers[0] == NULL || s_preview_buffers[1] == NULL) {
+    if (s_jpeg_buffer == NULL || s_decode_buffer == NULL) {
         ESP_LOGE(TAG, "PSRAM allocation failed");
         return false;
     }
@@ -879,23 +826,13 @@ static bool allocate_buffers(void)
 
 void app_main(void)
 {
-    s_uart_tx_mutex = xSemaphoreCreateMutex();
-    assert(s_uart_tx_mutex != NULL);
-    esp_log_set_vprintf(serial_log_write);
     s_frame_ready = xSemaphoreCreateCounting(1, 0);
     s_frame_mutex = xSemaphoreCreateMutex();
-    s_preview_mutex = xSemaphoreCreateMutex();
-    s_green_map_mutex = xSemaphoreCreateMutex();
-    if (s_frame_ready == NULL || s_frame_mutex == NULL || s_preview_mutex == NULL ||
-        s_green_map_mutex == NULL ||
-        !allocate_buffers()) {
+    if (s_frame_ready == NULL || s_frame_mutex == NULL || !allocate_buffers()) {
         ESP_LOGE(TAG, "initialization failed");
         return;
     }
-    init_serial();
-    assert(xTaskCreate(serial_command_task, "serial_command", 4096, NULL, 3, NULL) == pdPASS);
     assert(xTaskCreate(camera_process_task, "camera_process", 8192, NULL, 6, NULL) == pdPASS);
-    assert(xTaskCreate(preview_stream_task, "preview_stream", 4096, NULL, 4, NULL) == pdPASS);
 
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
@@ -915,8 +852,8 @@ void app_main(void)
     ESP_ERROR_CHECK(uvc_host_install(&uvc_config));
     configure_motor_hardware();
     assert(xTaskCreate(green_ball_control_task, "green_ball_control", 4096, NULL, 5, NULL) == pdPASS);
-    ESP_LOGI(TAG, "camera=%s D-=GPIO%d D+=GPIO%d; green detection at 10 FPS",
+    ESP_LOGI(TAG, "camera=%s D-=GPIO%d D+=GPIO%d; offline green detection at 10 FPS",
              CAMERA_MODEL_NAME, USB_D_MINUS_GPIO, USB_D_PLUS_GPIO);
-    ESP_LOGI(TAG, "waiting for UVC camera; PC viewer sends v to enable 640x480 JPEG preview");
+    ESP_LOGI(TAG, "waiting for UVC camera; no computer viewer is required");
     ESP_LOGI(TAG, "green control ready: press BOOT to start");
 }

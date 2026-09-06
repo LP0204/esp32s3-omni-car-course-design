@@ -1,14 +1,20 @@
-# Green Ball Push
+# Green Ball Push（离线版）
 
-基于 ESP32-S3 和 JQ-CAM12-720D-V1（ESP-Claw 三合一摄像头）的绿色目标测试工程。
+基于 ESP32-S3 和 JQ-CAM12-720D-V1（ESP-Claw 三合一摄像头）的绿色目标推送工程。摄像头取帧、JPEG 解码、绿度识别和电机控制全部在单片机上完成；工程不再传输图像到电脑，也不需要浏览器查看器。
 
-## 功能
+## 运行逻辑
 
-- 单片机在 80×60 采样图上计算绿度：`G - (R+B)/2`。
-- 连续 3 帧检测到至少 20 个绿色像素后执行：前进 → 停顿 → 后退。
-- 本版本不转向，方便先验证绿色识别和直行/返回动作。
-- 电脑端可查看摄像头原始 JPEG 图像，优先选择 **640×480（480p）**；如果摄像头不提供该模式，会按日志中的备用模式运行。预览串口恢复为 921600，使用双缓冲；实际帧率需要上板测量。
-- 浏览器提供绿度阈值滑块，调整会实时下发到单片机并立即影响绿度图和识别。
+1. 上电后摄像头持续取图，并在单片机内把图像按 80×60 网格采样。
+2. 每个采样点计算绿度 `G - (R+B)/2`。绿度大于阈值且 G 通道亮度足够时判为绿色。
+3. 按下开发板 **BOOT**（GPIO0）后，小车先以右转小脉冲搜索绿色目标；连续 3 帧检测到至少 3 个绿色采样点后进入对准状态。
+4. 对准时根据绿色质心相对画面中心的误差做小角度转动；每次转动结束立即对三只轮施加全功率主动刹车 90 ms，再等待车体稳定。如果越过中心，自动反向并将步长缩短为原来的 2/3，最小 20 ms。绿色质心在中心 ±5 个采样点内连续稳定 3 帧后，执行：
+   - 前进 900 ms；
+   - 停止 500 ms；
+   - 后退 930 ms；
+   - 完成后停止，等待下一次 BOOT。
+5. 动作期间再次按 BOOT 会立即停止电机并回到空闲状态。
+
+单片机只输出低速文字日志，断开电脑后仍可独立运行。电脑端不再打开图像窗口；如需查看运行状态，可用 VS Code 的 Monitor Device，以 115200 波特率查看日志。
 
 ## 接线情况 2
 
@@ -23,29 +29,42 @@
 | 电机 STBY | GPIO11 |
 | BOOT 按键 | GPIO0 |
 
-## 使用
+## 使用方法
 
-1. 在 VS Code 单独打开本文件夹，确认 `.vscode/settings.json` 中的 `idf.port` 是当前串口；若单独使用 Monitor Device，应用日志波特率为 921600，启动日志仍为 115200。查看图像时请关闭 Monitor。
-2. 运行任务 **Green Ball: Flash and Open 480p Preview**。任务会烧录固件、启动电脑端查看器，并打开 `http://127.0.0.1:8767/`。
-3. 浏览器会同时显示摄像头原图和单片机实际使用的 80×60 绿度二值图；两幅图都已按车上安装方向旋转 180°。把绿色目标放在摄像头视野中后，按一次开发板 **BOOT**，开始等待绿色目标。
-4. 识别成功后日志会显示 `green detected`，小车前进 `900 ms`，停顿 `500 ms`，再后退 `930 ms`。
-5. 再按一次 BOOT 可停止电机。查看器退出用终端 `Ctrl+C`。
+1. 在 VS Code 打开本文件夹，确认 `.vscode/settings.json` 中的 `idf.port` 是开发板当前串口。
+2. 使用 ESP-IDF 的 **Build** 和 **Flash Device** 烧录；不需要运行任何查看器脚本。
+3. 烧录完成后按一次 BOOT，看到日志 `BOOT: searching green` 即开始向右搜索。
+4. 将绿色目标放入摄像头视野。日志会依次显示 `green detected`、`align step`、`green centered`，然后小车执行前进、停顿、后退。
 
-若只想烧录而不看图像，可在 ESP-IDF 面板直接执行 Flash；串口日志仍会显示绿度采样结果。
+日志中的 `green` 是最终满足绿度和亮度条件的采样点数，`bright` 是达到最低 G 通道亮度的点数，`metric` 是只满足绿度条件的点数，`maxG` 是当前帧最大绿度，`peak` 是最大 G 通道值。若 `green` 长期为 0，同时 `maxG` 小于 30，说明阈值过高或光照不足；若 `green` 有数值但小于 `need=3`，说明目标在画面中太小，可根据日志再调整触发点数。
 
-## 绿度参数
+## 主要参数
 
-在 `main/main.c` 顶部调整：
+参数均在 `main/main.c` 顶部：
 
 ```c
-#define GREENNESS_THRESHOLD_DEFAULT 42  // 默认绿度优势阈值，越小越容易判绿
-#define GREEN_MIN_CHANNEL 75    // G 通道最低亮度
-#define GREEN_PIXELS_TO_TRIGGER 20
+#define GREENNESS_THRESHOLD 30 // 绿度阈值；越小越容易判定为绿色
+#define GREEN_MIN_CHANNEL 75   // G 通道最低亮度
+#define GREEN_PIXELS_TO_TRIGGER 3 // 远距离目标的最少绿色采样点数
 #define GREEN_CONFIRM_FRAMES 3
+#define TURN_STEP_POWER 70          // 旋转 PWM 命令
+#define SEARCH_STEP_MS 40           // 找不到目标时，每次向右转动的时间
+#define TURN_BRAKE_MS 90            // 每次旋转后的主动急刹时间
+#define TURN_SETTLE_MS 200          // 每次转动后的稳定等待时间
+#define ALIGN_INITIAL_STEP_MS 50     // 对准初始转动步长
+#define ALIGN_MIN_STEP_MS 20         // 过冲后步长下限
+#define OVERSHOOT_REVERSE_NUMERATOR 2
+#define OVERSHOOT_REVERSE_DENOMINATOR 3
 ```
 
-电机直行功率和动作时间也在同一处：`LEFT_STRAIGHT_POWER_PERCENT`、`RIGHT_STRAIGHT_POWER_PERCENT`、`PUSH_FORWARD_MS`、`PUSH_PAUSE_MS`、`PUSH_RETURN_MS`。
+与 `red-ball-push` 保持一致的运动参数为：
 
-## 电脑端查看器
+```c
+#define LEFT_STRAIGHT_POWER_PERCENT 58
+#define RIGHT_STRAIGHT_POWER_PERCENT 62
+#define PUSH_FORWARD_MS 900
+#define PUSH_PAUSE_MS 500
+#define PUSH_RETURN_MS 930
+```
 
-`tools/green_viewer.py` 接收 `JPG4`（原始 JPEG）和 `GMAP`（80×60 绿度二值图）串口帧并校验 CRC16，在浏览器中显示 640×480 原图和单片机实际判定图。页面将两幅图同步旋转 180°，并通过 `/set-threshold` 将滑块值以 `gNNN` 命令发给 ESP32。它每秒发送一次 `v` 开启预览；关闭查看器时发送 `x`。图像传输不会参与绿度计算，也不会改变电机状态机。
+绿度阈值或动作速度/时间调整后，重新 Build 并 Flash 即可生效。

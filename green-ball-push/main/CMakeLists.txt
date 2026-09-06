@@ -6,7 +6,6 @@ idf_component_register(
         esp_psram
         esp_driver_gpio
         esp_driver_ledc
-        esp_driver_uart
         esp_timer
         esp_jpeg
 )
