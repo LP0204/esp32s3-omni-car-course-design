@@ -1,0 +1,36 @@
+# 目标芯片
+CONFIG_IDF_TARGET="esp32s3"
+
+# 控制台：UART0，115200
+# 摄像头占用 GPIO19/20（USB D-/D+），必须关闭 USB-Serial-JTAG 控制台
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# CPU 240 MHz
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Flash：WROOM-2 为 32MB，沿用本车已验证的 DIO/80M 启动配置
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# PSRAM：ESP32-S3-WROOM-2 内置 Octal PSRAM（8/16MB），UVC 取流必需
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# JPEG 解码：ESP32-S3 没有硬件 JPEG 编解码器（那是 P4 的），
+# 使用 esp_jpeg（TJpgDec 软件解码）。UVC 摄像头帧常不带 Huffman 表，
+# 所以关闭 ROM 版并启用默认 Huffman 表支持。
+CONFIG_JD_USE_ROM=n
+CONFIG_JD_DEFAULT_HUFFMAN=y
+
+# USB：UVC 摄像头的配置描述符常超过 256 字节（默认值），
+# 枚举会被拒（"Configuration descriptor larger than control transfer max length"），
+# 加大每个设备的控制传输缓冲。
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=2048
+
+# USB Host UVC（v2 原生驱动）：连接时打印完整配置描述符，便于排查
+# 摄像头描述符不规范导致的格式解析失败。
+CONFIG_UVC_PRINTF_CONFIGURATION_DESCRIPTOR=y

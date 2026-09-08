@@ -1,0 +1,12 @@
+# ESP-IDF generated output and local build backups
+/build/
+/build_*/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+
+# Local machine/editor files
+/.vscode/
+.DS_Store
+__pycache__/
+*.pyc
