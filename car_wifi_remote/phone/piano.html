@@ -24,7 +24,7 @@ h1{font-size:20px;margin:0 0 4px;color:#155e9e;text-align:center;}
 <body>
 <div class="card">
 <h1>钢琴</h1>
-<div class="hint">触屏点按发声；电脑键盘：高音 QWERTYU / 中音 ASDFGHJ / 低音 ZXCVBNM</div>
+<div class="hint">触屏点按发声；电脑键盘：高音 QWERTYU / 中音 ASDFGHJ / 低音 ZXCVBNM<br><span id="pianoConn">音符通道连接中…</span></div>
 <div class="volRow"><span style="font-size:13px;color:#7d96ab;">音量</span>
 <input type="range" id="vol" min="0" max="200" step="1" value="55">
 <span id="volLabel">55%</span></div>
@@ -36,22 +36,29 @@ var names=['C','D','E','F','G','A','B'];
 var octaves=[5,4,3];
 var keyRows=['qwertyu','asdfghj','zxcvbnm'];
 function request(path){fetch(path,{cache:'no-store'}).catch(function(){});}
-/* Keep note commands in browser order. Separate fetches can otherwise
- * arrive out of order when several keys are pressed together. */
-var noteQueue=Promise.resolve();
-function send(n,down){var path='/note?note='+n+'&on='+(down===false?0:1);noteQueue=noteQueue.then(function(){return fetch(path,{cache:'no-store'});}).catch(function(){});}
+var conn=document.getElementById('pianoConn'),ws=null,retryTimer=null,leaving=false;
+var sid=(((Date.now()>>>0)^((Math.random()*4294967295)>>>0))>>>0)||1,seq=0,mask=0;
+function statePacket(){seq=(seq+1)>>>0;return sid.toString(16)+':'+seq.toString(16)+':'+mask.toString(16);}
+function sendState(){if(ws&&ws.readyState===WebSocket.OPEN){try{ws.send(statePacket());}catch(e){}}}
+function connectPiano(){
+  if(leaving||(ws&&(ws.readyState===WebSocket.OPEN||ws.readyState===WebSocket.CONNECTING)))return;
+  conn.textContent='音符通道连接中…';ws=new WebSocket('ws://'+location.host+'/piano-ws');
+  ws.onopen=function(){conn.textContent='音符通道已连接';sendState();};
+  ws.onclose=function(){conn.textContent='音符通道已断开，正在重连…';ws=null;if(!leaving){clearTimeout(retryTimer);retryTimer=setTimeout(connectPiano,250);}};
+  ws.onerror=function(){conn.textContent='音符通道连接失败';};
+}
 var volEl=document.getElementById('vol'),volLb=document.getElementById('volLabel');
 function onVol(){var pct=parseInt(volEl.value,10);volLb.textContent=pct<=100?pct+'%':('增强 '+pct+'%');request('/volume?pct='+pct);}
 volEl.addEventListener('input',onVol);volEl.addEventListener('change',onVol);
-var rows=document.getElementById('rows'),keyMap={},held={},order=[],cur=0;
+var rows=document.getElementById('rows'),keyMap={},held={};
 octaves.forEach(function(oct,r){
   var div=document.createElement('div');div.className='row';
   names.forEach(function(nm,c){
     var btn=document.createElement('button');btn.className='key';
     var f=(2-r)*7+c+1,key=keyRows[r][c];
     btn.innerHTML='<b>'+nm+oct+'</b><span>键 '+key.toUpperCase()+'</span>';
-    function dn(e){e.preventDefault();if(held[key]!==undefined)return;held[key]=f;order.push(key);cur=f;send(f,true);btn.classList.add('on');}
-    function up(){if(held[key]===undefined)return;delete held[key];order=order.filter(function(k){return k!==key;});send(f,false);if(cur===f){var k=order.length?order[order.length-1]:null;cur=k===null?0:held[k];if(cur)send(cur,true);}btn.classList.remove('on');}
+    function dn(e){e.preventDefault();if(held[key]!==undefined)return;held[key]=f;mask=(mask|(1<<(f-1)))>>>0;sendState();btn.classList.add('on');}
+    function up(){if(held[key]===undefined)return;delete held[key];mask=(mask&~(1<<(f-1)))>>>0;sendState();btn.classList.remove('on');}
     btn.addEventListener('touchstart',dn,{passive:false});
     btn.addEventListener('touchend',up);
     btn.addEventListener('touchcancel',up);
@@ -64,8 +71,12 @@ octaves.forEach(function(oct,r){
 });
 window.addEventListener('keydown',function(e){var k=e.key.toLowerCase();if(keyMap[k]&&!e.repeat){keyMap[k].dispatchEvent(new MouseEvent('mousedown'));}});
 window.addEventListener('keyup',function(e){var k=e.key.toLowerCase();if(keyMap[k]){keyMap[k].dispatchEvent(new MouseEvent('mouseup'));}});
-window.addEventListener('blur',function(){if(!order.length)return;order.slice().forEach(function(k){if(keyMap[k])keyMap[k].dispatchEvent(new MouseEvent('mouseup'));});});
-setInterval(function(){if(cur)send(cur,true);},800);
+function releaseAll(){Object.keys(held).forEach(function(k){if(keyMap[k])keyMap[k].classList.remove('on');});held={};mask=0;sendState();}
+window.addEventListener('blur',releaseAll);
+document.addEventListener('visibilitychange',function(){if(document.hidden)releaseAll();});
+window.addEventListener('pagehide',function(){leaving=true;releaseAll();if(ws)ws.close();});
+setInterval(sendState,250);
+connectPiano();
 </script>
 </body>
 </html>

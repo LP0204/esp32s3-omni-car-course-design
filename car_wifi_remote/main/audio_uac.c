@@ -615,12 +615,12 @@ void audio_uac_note_event(uint8_t note, bool pressed)
     portEXIT_CRITICAL(&s_voice_mux);
 
     if (log_on) {
-        ESP_LOGI(TAG, "chord note on=%u (%u Hz)", log_note, s_note_hz[log_note]);
+        ESP_LOGD(TAG, "chord note on=%u (%u Hz)", log_note, s_note_hz[log_note]);
     } else if (log_off) {
         if (log_note == 0) {
-            ESP_LOGI(TAG, "chord all notes release: %" PRIu32 "ms", (uint32_t)AUDIO_RELEASE_MS);
+            ESP_LOGD(TAG, "chord all notes release: %" PRIu32 "ms", (uint32_t)AUDIO_RELEASE_MS);
         } else {
-            ESP_LOGI(TAG, "chord note off=%u: %" PRIu32 "ms release",
+            ESP_LOGD(TAG, "chord note off=%u: %" PRIu32 "ms release",
                      log_note, (uint32_t)AUDIO_RELEASE_MS);
         }
     }
