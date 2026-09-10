@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>钢琴</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+body{margin:0;font-family:-apple-system,'PingFang SC',sans-serif;background:linear-gradient(160deg,#eaf6ff,#f6fbff);color:#1d2a3a;user-select:none;padding:12px;}
+.card{background:#fff;border-radius:18px;box-shadow:0 6px 18px rgba(31,88,146,.10);padding:16px;margin:0 auto;max-width:500px;}
+h1{font-size:20px;margin:0 0 4px;color:#155e9e;text-align:center;}
+.hint{font-size:12px;color:#7d96ab;text-align:center;margin-bottom:14px;}
+.volRow{display:flex;align-items:center;gap:10px;margin:10px 0 6px;}
+#vol{flex:1;accent-color:#155e9e;}
+#volLabel{font-size:14px;color:#155e9e;min-width:50px;text-align:right;font-weight:600;}
+.row{display:flex;gap:6px;margin-bottom:8px;}
+.key{flex:1;height:84px;border:none;border-radius:10px;background:linear-gradient(180deg,#fff,#e4eef6);color:#155e9e;box-shadow:0 3px 0 rgba(20,50,80,.18);touch-action:none;}
+.key b{display:block;font-size:22px;}
+.key span{font-size:11px;color:#8ba6bd;}
+.key.on{background:linear-gradient(180deg,#7ec8ff,#2f7ec2);color:#fff;box-shadow:0 1px 0 rgba(20,50,80,.18);transform:translateY(2px);}
+.back{display:block;text-align:center;margin-top:14px;color:#155e9e;font-size:14px;text-decoration:none;}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>钢琴</h1>
+<div class="hint">触屏点按发声；电脑键盘：高音 QWERTYU / 中音 ASDFGHJ / 低音 ZXCVBNM</div>
+<div class="volRow"><span style="font-size:13px;color:#7d96ab;">音量</span>
+<input type="range" id="vol" min="0" max="200" step="1" value="55">
+<span id="volLabel">55%</span></div>
+<div id="rows"></div>
+<a class="back" href="/">← 返回遥控</a>
+</div>
+<script>
+var names=['C','D','E','F','G','A','B'];
+var octaves=[5,4,3];
+var keyRows=['qwertyu','asdfghj','zxcvbnm'];
+function request(path){fetch(path,{cache:'no-store'}).catch(function(){});}
+/* Keep note commands in browser order. Separate fetches can otherwise
+ * arrive out of order when several keys are pressed together. */
+var noteQueue=Promise.resolve();
+function send(n,down){var path='/note?note='+n+'&on='+(down===false?0:1);noteQueue=noteQueue.then(function(){return fetch(path,{cache:'no-store'});}).catch(function(){});}
+var volEl=document.getElementById('vol'),volLb=document.getElementById('volLabel');
+function onVol(){var pct=parseInt(volEl.value,10);volLb.textContent=pct<=100?pct+'%':('增强 '+pct+'%');request('/volume?pct='+pct);}
+volEl.addEventListener('input',onVol);volEl.addEventListener('change',onVol);
+var rows=document.getElementById('rows'),keyMap={},held={},order=[],cur=0;
+octaves.forEach(function(oct,r){
+  var div=document.createElement('div');div.className='row';
+  names.forEach(function(nm,c){
+    var btn=document.createElement('button');btn.className='key';
+    var f=(2-r)*7+c+1,key=keyRows[r][c];
+    btn.innerHTML='<b>'+nm+oct+'</b><span>键 '+key.toUpperCase()+'</span>';
+    function dn(e){e.preventDefault();if(held[key]!==undefined)return;held[key]=f;order.push(key);cur=f;send(f,true);btn.classList.add('on');}
+    function up(){if(held[key]===undefined)return;delete held[key];order=order.filter(function(k){return k!==key;});send(f,false);if(cur===f){var k=order.length?order[order.length-1]:null;cur=k===null?0:held[k];if(cur)send(cur,true);}btn.classList.remove('on');}
+    btn.addEventListener('touchstart',dn,{passive:false});
+    btn.addEventListener('touchend',up);
+    btn.addEventListener('touchcancel',up);
+    btn.addEventListener('mousedown',dn);
+    btn.addEventListener('mouseup',up);
+    btn.addEventListener('mouseleave',up);
+    keyMap[key]=btn;div.appendChild(btn);
+  });
+  rows.appendChild(div);
+});
+window.addEventListener('keydown',function(e){var k=e.key.toLowerCase();if(keyMap[k]&&!e.repeat){keyMap[k].dispatchEvent(new MouseEvent('mousedown'));}});
+window.addEventListener('keyup',function(e){var k=e.key.toLowerCase();if(keyMap[k]){keyMap[k].dispatchEvent(new MouseEvent('mouseup'));}});
+window.addEventListener('blur',function(){if(!order.length)return;order.slice().forEach(function(k){if(keyMap[k])keyMap[k].dispatchEvent(new MouseEvent('mouseup'));});});
+setInterval(function(){if(cur)send(cur,true);},800);
+</script>
+</body>
+</html>
