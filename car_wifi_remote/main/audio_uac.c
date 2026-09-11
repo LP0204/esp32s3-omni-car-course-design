@@ -31,7 +31,12 @@ static const char *TAG = "uac_piano";
 #define AUDIO_DEVICE_BUFFER_THRESHOLD 4000
 #define AUDIO_PCM_BUFFER_BYTES      8192
 #define AUDIO_VOLUME_PERCENT          55
-#define AUDIO_AMPLITUDE             9000
+#define AUDIO_AMPLITUDE_HIGH        7000 /* QWERTYU / C5..B5 */
+#define AUDIO_AMPLITUDE_MIDDLE      9000 /* ASDFGHJ / C4..B4 */
+#define AUDIO_AMPLITUDE_LOW        10000 /* ZXCVBNM / C3..B3 */
+#define AUDIO_LOW_PEAK_LIMIT       16000
+#define AUDIO_CHORD_PEAK_LIMIT     24000
+#define AUDIO_VOLUME_MAX_PERCENT     140
 #define AUDIO_NOTE_COUNT              22 /* index 0 = silence, 1..21 = notes */
 
 typedef struct {
@@ -116,6 +121,17 @@ static uint32_t envelope_samples(uint32_t duration_ms)
 {
     uint32_t samples = (uint32_t)(((uint64_t)s_sample_rate * duration_ms) / 1000U);
     return samples == 0 ? 1 : samples;
+}
+
+static uint32_t note_amplitude(uint8_t note)
+{
+    if (note <= 7) {
+        return AUDIO_AMPLITUDE_LOW;
+    }
+    if (note <= 14) {
+        return AUDIO_AMPLITUDE_MIDDLE;
+    }
+    return AUDIO_AMPLITUDE_HIGH;
 }
 
 static void driver_event_cb(uint8_t addr, uint8_t iface_num,
@@ -364,22 +380,37 @@ static size_t make_pcm_chunk(audio_voice_t voices[AUDIO_NOTE_COUNT],
         frames = sizeof(s_pcm) / frame_bytes;
     }
 
-    uint8_t sounding = 0;
+    uint32_t scaled_amp[AUDIO_NOTE_COUNT] = { 0 };
+    uint64_t theoretical_peak = 0;
     for (uint8_t n = 1; n < AUDIO_NOTE_COUNT; n++) {
+        scaled_amp[n] =
+            (note_amplitude(n) * (uint32_t)s_gain_pct) / 100U;
+        if (n <= 7 && scaled_amp[n] > AUDIO_LOW_PEAK_LIMIT) {
+            /* The small speaker reaches its excursion limit first on low
+             * notes. Extra low-frequency drive mostly becomes upper
+             * harmonics, so cap it before mixing. */
+            scaled_amp[n] = AUDIO_LOW_PEAK_LIMIT;
+        }
         if (voices[n].active) {
-            sounding++;
+            /* An attacking voice can reach full level inside this 10 ms
+             * chunk. A releasing voice can only become quieter, so its
+             * current envelope level is the safe peak estimate. */
+            const uint32_t peak_level = voices[n].attack_remaining != 0
+                                            ? 32767U
+                                            : voices[n].level_q15;
+            theoretical_peak +=
+                ((uint64_t)scaled_amp[n] * peak_level + 32766U) / 32767U;
         }
     }
-    /* Scale the mixed voices only when their theoretical peak would exceed
-     * 16-bit PCM full scale. This preserves the loudness of a single note,
-     * while also keeping boosted chords free of digital clipping. */
-    const uint32_t full_amp = (AUDIO_AMPLITUDE * (uint32_t)s_gain_pct) / 100U;
-    const uint64_t peak = (uint64_t)full_amp * sounding;
-    uint8_t divisor = (peak == 0) ? 1 : (uint8_t)((peak + 32766U) / 32767U);
-    if (divisor == 0) {
-        divisor = 1;
+    /* Keep each voice at normal loudness and apply one continuous gain only
+     * when the chord's envelope-weighted theoretical peak needs headroom.
+     * Unlike dividing by the number of active slots, a nearly silent release
+     * tail no longer makes newly pressed notes suddenly quieter. */
+    uint32_t chord_gain_q15 = 32767U;
+    if (theoretical_peak > AUDIO_CHORD_PEAK_LIMIT) {
+        chord_gain_q15 = (uint32_t)
+            (((uint64_t)AUDIO_CHORD_PEAK_LIMIT * 32767U) / theoretical_peak);
     }
-    const int32_t amp = (int32_t)(full_amp / divisor);
     uint32_t phase_step[AUDIO_NOTE_COUNT] = { 0 };
     for (uint8_t n = 1; n < AUDIO_NOTE_COUNT; n++) {
         phase_step[n] = (uint32_t)(((uint64_t)s_note_hz[n] << 32) / rate);
@@ -393,7 +424,8 @@ static size_t make_pcm_chunk(audio_voice_t voices[AUDIO_NOTE_COUNT],
                 continue;
             }
             const int32_t wave = sine_sample_interpolated(voice->phase);
-            int32_t sample = (wave * amp) / 32767;
+            int32_t sample =
+                (int32_t)(((int64_t)wave * scaled_amp[n]) / 32767);
             sample = (int32_t)(((int64_t)sample * voice->level_q15) / 32767);
 
             if (voice->attack_remaining != 0) {
@@ -424,6 +456,7 @@ static size_t make_pcm_chunk(audio_voice_t voices[AUDIO_NOTE_COUNT],
             mixed += sample;
             voice->phase += phase_step[n];
         }
+        mixed = (mixed * chord_gain_q15) / 32767;
         if (mixed > 32767) {
             mixed = 32767;
         } else if (mixed < -32768) {
@@ -586,22 +619,23 @@ void audio_uac_note_event(uint8_t note, bool pressed)
             log_off = true;
         }
     } else {
+        /* A fresh key press replaces every released note that is still in
+         * its 300 ms tail. Notes that are physically still held remain
+         * active, so simultaneous keys continue to form a chord. */
+        for (uint8_t n = 1; n < AUDIO_NOTE_COUNT; n++) {
+            audio_voice_t *releasing = &s_voices[n];
+            if (releasing->active && releasing->release_remaining != 0) {
+                memset(releasing, 0, sizeof(*releasing));
+                changed = true;
+            }
+        }
+
         audio_voice_t *voice = &s_voices[note];
         if (!voice->active) {
             voice->active = 1;
             voice->phase = 0;
             voice->level_q15 = 0;
             voice->attack_remaining = envelope_samples(AUDIO_ATTACK_MS);
-            voice->release_remaining = 0;
-            voice->release_total = 0;
-            changed = true;
-        } else if (voice->release_remaining != 0) {
-            /* 重新按下时保留相位和当前音量，再用短淡入回到满幅，
-             * 避免波形或包络突然跳变造成哒声。 */
-            const uint32_t full_attack = envelope_samples(AUDIO_ATTACK_MS);
-            const uint32_t gap = 32767U - voice->level_q15;
-            voice->attack_remaining = (uint32_t)
-                (((uint64_t)full_attack * gap + 32766U) / 32767U);
             voice->release_remaining = 0;
             voice->release_total = 0;
             changed = true;
@@ -655,8 +689,8 @@ uint8_t audio_uac_current_note(void)
 
 void audio_uac_set_volume_percent(uint16_t percent)
 {
-    if (percent > 200) {
-        percent = 200;
+    if (percent > AUDIO_VOLUME_MAX_PERCENT) {
+        percent = AUDIO_VOLUME_MAX_PERCENT;
     }
     s_volume_pct = percent;
 

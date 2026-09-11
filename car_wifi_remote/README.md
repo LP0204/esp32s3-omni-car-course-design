@@ -109,9 +109,9 @@ idf.py -p /dev/cu.usbserial-0001 monitor
 | 中音 | 262 | 294 | 330 | 349 | 392 | 440 | 494 Hz |
 | 高音 | 523 | 587 | 659 | 698 | 784 | 880 | 988 Hz |
 
-松开按键后音符保持约 300 ms 并逐渐减弱；新按键可以立即加入和弦。音量滑块范围为 0～200%：0 为静音，100% 为设备音量范围，超过 100% 为软件增益，过高时可能使小扬声器失真。
+松开按键后音符保持约 300 ms 并逐渐减弱；新按键可以立即加入和弦。当前三排默认振幅分别为：高音 `QWERTYU` 7000、中音 `ASDFGHJ` 9000、低音 `ZXCVBNM` 10000。音量滑块范围为 0～140%：0 为静音，100% 为设备音量范围，超过 100% 为受限的软件增益。为减少大音量时高次谐波造成的“音调变高”听感，混音峰值限制为 24000，低音峰值限制为 16000。
 
-钢琴按键通过一条 WebSocket 长连接传输。每次变化发送当前全部 21 键状态、页面会话号和递增序号，避免快速输入时 HTTP 请求排队或乱序；页面每 250 ms 同步一次完整状态，链路中断超过 1 秒时 ESP32 自动释放所有音符。页面上会显示“音符通道已连接”，看到该提示后再开始演奏。
+钢琴按键通过一条 WebSocket 长连接传输。每次变化发送当前全部 21 键状态、页面会话号和递增序号，避免快速输入时 HTTP 请求排队或乱序；页面每 250 ms 同步一次完整状态，链路中断超过 1 秒时 ESP32 自动释放所有音符。页面上会显示“音符通道已连接”，看到该提示后再开始演奏。仍被同时按住的按键会组成和弦；松键后的声音渐弱 300 ms，但在新按键按下时会立即清除已有尾音，避免快速演奏时声音堆积。
 
 ## 可调参数
 
@@ -120,7 +120,7 @@ idf.py -p /dev/cu.usbserial-0001 monitor
 - 电机速度：`main/main.c` 顶部的 `LF_FWD_SPEED`、`RF_FWD_SPEED`、`TURN_SPEED`；
 - 云台单次步进角：`main/main.c` 中的 `SERVO_STEP_DEG`；
 - 舵机脉宽范围、PWM 频率：`main/servo.c` 中的 `PULSE_MIN_US`、`PULSE_MAX_US`、`SERVO_FREQ_HZ`；
-- 音量基础振幅和音频缓冲：`main/audio_uac.c` 顶部的 `AUDIO_AMPLITUDE`、`AUDIO_DEVICE_BUFFER_BYTES`、`AUDIO_PREBUFFER_CHUNKS`。
+- 三排基础振幅、低音峰值、混音峰值和音频缓冲：`main/audio_uac.c` 顶部的 `AUDIO_AMPLITUDE_HIGH`、`AUDIO_AMPLITUDE_MIDDLE`、`AUDIO_AMPLITUDE_LOW`、`AUDIO_LOW_PEAK_LIMIT`、`AUDIO_CHORD_PEAK_LIMIT`、`AUDIO_DEVICE_BUFFER_BYTES`、`AUDIO_PREBUFFER_CHUNKS`。
 
 ## HTTP 接口
 
@@ -130,7 +130,7 @@ GET /joy?x=-100..100&y=-100..100
 GET /speed?level=med|high|ultra
 GET /servo?act=up|down|left|right|reset
 GET /note?note=1..21&on=1|0
-GET /volume?pct=0..200
+GET /volume?pct=0..140
 GET /stream                 （81 端口）
 GET /ping
 GET /voicecmd?act=forward|back|left|right|strleft|strright|stop&ms=0..5000

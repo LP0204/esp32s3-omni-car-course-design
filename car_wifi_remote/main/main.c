@@ -50,6 +50,7 @@
 #define PIANO_NOTE_COUNT  21
 #define PIANO_MASK_ALL    ((1U << PIANO_NOTE_COUNT) - 1U)
 #define PIANO_LINK_TIMEOUT_MS 1000
+#define PIANO_VOLUME_MAX_PERCENT 140
 
 static const char *TAG = "car_remote";
 static int64_t s_last_cmd_us = 0;
@@ -303,8 +304,8 @@ static esp_err_t volume_handler(httpd_req_t *req)
     int pct = atoi(vs);
     if (pct < 0) {
         pct = 0;
-    } else if (pct > 200) {
-        pct = 200;
+    } else if (pct > PIANO_VOLUME_MAX_PERCENT) {
+        pct = PIANO_VOLUME_MAX_PERCENT;
     }
     audio_uac_set_volume_percent((uint16_t)pct);
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -346,12 +347,23 @@ static void piano_apply_mask_locked(uint32_t new_mask)
 {
     new_mask &= PIANO_MASK_ALL;
     const uint32_t changed = s_piano_mask ^ new_mask;
+    const uint32_t released = changed & ~new_mask;
+    const uint32_t pressed = changed & new_mask;
     s_piano_mask = new_mask;
 
+    /* A single browser update can release an old key and press a new one.
+     * Always process releases first so the following note-on can clear those
+     * tails consistently, regardless of the notes' numeric order. */
     for (uint8_t note = 1; note <= PIANO_NOTE_COUNT; note++) {
         const uint32_t bit = 1U << (note - 1U);
-        if ((changed & bit) != 0) {
-            audio_uac_note_event(note, (new_mask & bit) != 0);
+        if ((released & bit) != 0) {
+            audio_uac_note_event(note, false);
+        }
+    }
+    for (uint8_t note = 1; note <= PIANO_NOTE_COUNT; note++) {
+        const uint32_t bit = 1U << (note - 1U);
+        if ((pressed & bit) != 0) {
+            audio_uac_note_event(note, true);
         }
     }
 }
@@ -651,7 +663,7 @@ static const char PIANO_HTML[] =
 "<h1>钢琴</h1>\n"
 "<div class='hint'>触屏点按发声；电脑键盘：高音 QWERTYU / 中音 ASDFGHJ / 低音 ZXCVBNM<br><span id='pianoConn'>音符通道连接中…</span></div>\n"
 "<div class='volRow'><span style='font-size:13px;color:#7d96ab;'>音量</span>\n"
-"<input type='range' id='vol' min='0' max='200' step='1' value='55'>\n"
+"<input type='range' id='vol' min='0' max='140' step='1' value='55'>\n"
 "<span id='volLabel'>55%</span></div>\n"
 "<div id='rows'></div>\n"
 "<a class='back' href='/'>← 返回遥控</a>\n"
